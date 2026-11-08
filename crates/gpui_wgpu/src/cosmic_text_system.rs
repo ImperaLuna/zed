@@ -70,7 +70,11 @@ impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
         let spawned = std::thread::Builder::new()
             .name("gpui-load-fonts".to_string())
-            .spawn(FontSystem::new);
+            .spawn(|| {
+                let font_system = FontSystem::new();
+                crate::startup_phase("fonts-ready");
+                font_system
+            });
         match spawned {
             std::result::Result::Ok(thread) => Self {
                 state: OnceLock::new(),
@@ -81,7 +85,9 @@ impl CosmicTextSystem {
             },
             Err(error) => {
                 log::warn!("could not start the font loading thread: {error}");
-                Self::with_font_system(FontSystem::new(), system_font_fallback)
+                let font_system = FontSystem::new();
+                crate::startup_phase("fonts-ready");
+                Self::with_font_system(font_system, system_font_fallback)
             }
         }
     }

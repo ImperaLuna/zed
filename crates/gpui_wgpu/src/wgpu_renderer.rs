@@ -1307,6 +1307,8 @@ impl WgpuRenderer {
                 .queue
                 .submit(std::iter::once(encoder.finish()));
             frame.present();
+            static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+            FIRST_FRAME.call_once(|| crate::startup_phase("first-frame"));
             return;
         }
     }
@@ -1837,8 +1839,10 @@ where
 {
     let create = |backends: wgpu::Backends| {
         let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
+        crate::startup_phase("vulkan-instance");
         let surface = create_surface(&instance, raw_window_handle)?;
         let context = WgpuContext::new(instance, &surface, compositor_gpu)?;
+        crate::startup_phase("gpu-device");
         anyhow::Ok((context, surface))
     };
 
