@@ -1780,8 +1780,11 @@ impl WgpuRenderer {
             // Wait for GPU driver to stabilize (350ms copied from windows :shrug:)
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let (new_context, surface) =
-                create_context_and_surface(window, window_handle.as_raw(), self.compositor_gpu)?;
+            let (new_context, surface) = create_context_and_surface(
+                window,
+                window_handle.as_raw(),
+                self.compositor_gpu,
+            )?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
