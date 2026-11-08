@@ -55,6 +55,9 @@ pub const SUBPIXEL_VARIANTS_Y: u8 = if cfg!(target_os = "windows") || cfg!(targe
 pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
+    /// What each font resolved to, fallback included, so a font that is
+    /// missing walks the fallback stack once, not on every text run.
+    resolved_fonts: RwLock<FxHashMap<Font, FontId>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
     raster_bounds: RwLock<FxHashMap<RenderGlyphParams, Bounds<DevicePixels>>>,
     wrapper_pool: Mutex<FxHashMap<FontIdWithSize, Vec<LineWrapper>>>,
@@ -70,6 +73,7 @@ impl TextSystem {
             font_metrics: RwLock::default(),
             raster_bounds: RwLock::default(),
             font_ids_by_font: RwLock::default(),
+            resolved_fonts: RwLock::default(),
             wrapper_pool: Mutex::default(),
             font_runs_pool: Mutex::default(),
             fallback_font_stack: smallvec![
@@ -104,6 +108,7 @@ impl TextSystem {
 
     /// Add a font's data to the text system.
     pub fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+        self.resolved_fonts.write().clear();
         self.platform_text_system.add_fonts(fonts)
     }
 
@@ -150,6 +155,15 @@ impl TextSystem {
     ///
     /// Panics if the font and none of the fallbacks can be resolved.
     pub fn resolve_font(&self, font: &Font) -> FontId {
+        if let Some(font_id) = self.resolved_fonts.read().get(font) {
+            return *font_id;
+        }
+        let font_id = self.resolve_font_uncached(font);
+        self.resolved_fonts.write().insert(font.clone(), font_id);
+        font_id
+    }
+
+    fn resolve_font_uncached(&self, font: &Font) -> FontId {
         if let Ok(font_id) = self.font_id(font) {
             return font_id;
         }
@@ -1183,5 +1197,102 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod resolve_font_tests {
+    use super::*;
+    use crate::{NoopTextSystem, font};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Knows one family and counts every lookup.
+    struct OneFamily {
+        family: &'static str,
+        lookups: AtomicUsize,
+    }
+
+    impl PlatformTextSystem for OneFamily {
+        fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            NoopTextSystem.add_fonts(fonts)
+        }
+        fn all_font_names(&self) -> Vec<String> {
+            vec![self.family.to_string()]
+        }
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            if descriptor.family == self.family {
+                Ok(FontId(7))
+            } else {
+                Err(anyhow!("no font family {}", descriptor.family))
+            }
+        }
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            NoopTextSystem.font_metrics(font_id)
+        }
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            NoopTextSystem.typographic_bounds(font_id, glyph_id)
+        }
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            NoopTextSystem.advance(font_id, glyph_id)
+        }
+        fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
+            NoopTextSystem.glyph_for_char(font_id, ch)
+        }
+        fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
+            NoopTextSystem.glyph_raster_bounds(params)
+        }
+        fn rasterize_glyph(
+            &self,
+            params: &RenderGlyphParams,
+            raster_bounds: Bounds<DevicePixels>,
+        ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
+            NoopTextSystem.rasterize_glyph(params, raster_bounds)
+        }
+        fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
+            NoopTextSystem.layout_line(text, font_size, runs)
+        }
+        fn recommended_rendering_mode(
+            &self,
+            font_id: FontId,
+            font_size: Pixels,
+        ) -> TextRenderingMode {
+            NoopTextSystem.recommended_rendering_mode(font_id, font_size)
+        }
+    }
+
+    #[test]
+    fn a_missing_font_resolves_from_the_cache_after_the_first_time() {
+        let platform = Arc::new(OneFamily {
+            family: "DejaVu Sans",
+            lookups: AtomicUsize::new(0),
+        });
+        let text_system = TextSystem::new(platform.clone());
+        let missing = font(".SystemUIFont");
+
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+        assert!(
+            platform.lookups.load(Ordering::SeqCst) > 1,
+            "the fallback stack was walked"
+        );
+        // Later text runs read the answer instead of walking the fallback
+        // stack again, which built an error for every missing family.
+        assert_eq!(
+            text_system.resolved_fonts.read().get(&missing),
+            Some(&FontId(7))
+        );
+        assert_eq!(text_system.resolve_font(&missing), FontId(7));
+    }
+
+    #[test]
+    fn adding_fonts_forgets_what_fonts_resolved_to() {
+        let platform = Arc::new(OneFamily {
+            family: "DejaVu Sans",
+            lookups: AtomicUsize::new(0),
+        });
+        let text_system = TextSystem::new(platform);
+        text_system.resolve_font(&font(".SystemUIFont"));
+        text_system.add_fonts(Vec::new()).unwrap();
+        assert!(text_system.resolved_fonts.read().is_empty());
     }
 }
