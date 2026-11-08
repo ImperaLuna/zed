@@ -7786,10 +7786,12 @@ dependencies = [
  "raw-window-handle",
  "smallvec",
  "swash",
+ "sys-locale",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
  "wgpu",
+ "yeslogic-fontconfig-sys",
  "zed-font-kit",
 ]
 

@@ -1,4 +1,6 @@
 mod cosmic_text_system;
+#[cfg(feature = "fontconfig")]
+mod fontconfig;
 
 /// The log target of start-up phases ("vulkan-instance", "gpu-device",
 /// "fonts-ready", "first-frame"), logged at debug level as each one ends, so

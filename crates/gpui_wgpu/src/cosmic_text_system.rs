@@ -25,14 +25,14 @@ use swash::{
 
 pub struct CosmicTextSystem {
     state: OnceLock<RwLock<CosmicTextSystemState>>,
-    /// Reading every system font takes a while, most of all on a cold start,
-    /// so `new` starts it on its own thread and the first text call waits
-    /// for it. Meanwhile the platform connects and sets up the GPU.
+    /// Setting up the fonts takes a while, most of all on a cold start, so
+    /// `new` starts it on its own thread and the first text call waits for
+    /// it. Meanwhile the platform connects and sets up the GPU.
     loading: Mutex<Option<LoadingFonts>>,
 }
 
 struct LoadingFonts {
-    thread: JoinHandle<FontSystem>,
+    thread: JoinHandle<(FontSystem, Option<OnDemandFonts>)>,
     system_font_fallback: String,
 }
 
@@ -58,6 +58,9 @@ struct CosmicTextSystemState {
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
+    /// `Some` when fonts are read only once text needs them; `None` when
+    /// every system font was read up front.
+    on_demand: Option<OnDemandFonts>,
 }
 
 struct LoadedFont {
@@ -71,9 +74,9 @@ impl CosmicTextSystem {
         let spawned = std::thread::Builder::new()
             .name("gpui-load-fonts".to_string())
             .spawn(|| {
-                let font_system = FontSystem::new();
+                let fonts = start_fonts();
                 crate::startup_phase("fonts-ready");
-                font_system
+                fonts
             });
         match spawned {
             std::result::Result::Ok(thread) => Self {
@@ -85,9 +88,9 @@ impl CosmicTextSystem {
             },
             Err(error) => {
                 log::warn!("could not start the font loading thread: {error}");
-                let font_system = FontSystem::new();
+                let (font_system, on_demand) = start_fonts();
                 crate::startup_phase("fonts-ready");
-                Self::with_font_system(font_system, system_font_fallback)
+                Self::with_font_system(font_system, on_demand, system_font_fallback)
             }
         }
     }
@@ -97,13 +100,18 @@ impl CosmicTextSystem {
             "en-US".to_string(),
             cosmic_text::fontdb::Database::new(),
         );
-        Self::with_font_system(font_system, system_font_fallback)
+        Self::with_font_system(font_system, None, system_font_fallback)
     }
 
-    fn with_font_system(font_system: FontSystem, system_font_fallback: &str) -> Self {
+    fn with_font_system(
+        font_system: FontSystem,
+        on_demand: Option<OnDemandFonts>,
+        system_font_fallback: &str,
+    ) -> Self {
         Self {
             state: OnceLock::from(RwLock::new(CosmicTextSystemState::new(
                 font_system,
+                on_demand,
                 system_font_fallback.to_string(),
             ))),
             loading: Mutex::new(None),
@@ -117,15 +125,17 @@ impl CosmicTextSystem {
                 .lock()
                 .take()
                 .expect("fonts are either loading or loaded");
-            let font_system = loading.thread.join().unwrap_or_else(|_| {
+            let (font_system, on_demand) = loading.thread.join().unwrap_or_else(|_| {
                 log::error!("loading the system fonts panicked; going on without them");
-                FontSystem::new_with_locale_and_db(
+                let font_system = FontSystem::new_with_locale_and_db(
                     "en-US".to_string(),
                     cosmic_text::fontdb::Database::new(),
-                )
+                );
+                (font_system, None)
             });
             RwLock::new(CosmicTextSystemState::new(
                 font_system,
+                on_demand,
                 loading.system_font_fallback,
             ))
         })
@@ -133,9 +143,14 @@ impl CosmicTextSystem {
 }
 
 impl CosmicTextSystemState {
-    fn new(font_system: FontSystem, system_font_fallback: String) -> Self {
+    fn new(
+        font_system: FontSystem,
+        on_demand: Option<OnDemandFonts>,
+        system_font_fallback: String,
+    ) -> Self {
         Self {
             font_system,
+            on_demand,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
             loaded_fonts: Vec::new(),
@@ -151,14 +166,17 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn all_font_names(&self) -> Vec<String> {
-        let mut result = self
-            .state()
-            .read()
+        let mut state = self.state().write();
+        let state = &mut *state;
+        let mut result = state
             .font_system
             .db()
             .faces()
             .filter_map(|face| face.families.first().map(|family| family.0.clone()))
             .collect_vec();
+        if let Some(on_demand) = &mut state.on_demand {
+            result.extend(on_demand.family_names());
+        }
         result.sort();
         result.dedup();
         result
@@ -278,7 +296,10 @@ impl CosmicTextSystemState {
         name: &str,
         features: &FontFeatures,
     ) -> Result<SmallVec<[FontId; 4]>> {
-        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback);
+        let name = gpui::font_name_with_fallbacks(name, &self.system_font_fallback).to_string();
+        if let Some(on_demand) = &mut self.on_demand {
+            on_demand.load_family(&mut self.font_system, &name);
+        }
 
         let families = self
             .font_system
@@ -454,6 +475,10 @@ impl CosmicTextSystemState {
 
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
+        if let Some(on_demand) = &mut self.on_demand {
+            on_demand.load_fonts_for_text(&mut self.font_system, text);
+        }
+
         let mut attrs_list = AttrsList::new(&Attrs::new());
         let mut offs = 0;
         for run in font_runs {
@@ -705,4 +730,203 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+/// Sets up the fonts for a new text system: through fontconfig when it's
+/// there, so no font is read until text needs it, otherwise by reading every
+/// system font.
+fn start_fonts() -> (FontSystem, Option<OnDemandFonts>) {
+    #[cfg(feature = "fontconfig")]
+    if let Some(fontconfig) = crate::fontconfig::Fontconfig::new() {
+        let locale = sys_locale::get_locale().unwrap_or_else(|| "en-US".to_string());
+        let font_system =
+            FontSystem::new_with_locale_and_db(locale, cosmic_text::fontdb::Database::new());
+        return (font_system, Some(OnDemandFonts::new(fontconfig)));
+    }
+    (FontSystem::new(), None)
+}
+
+/// Reads a font file the first time text needs it: the files of a family
+/// when the family is asked for, and a file that draws a character when a
+/// line holds a character no font read so far has.
+#[cfg(feature = "fontconfig")]
+struct OnDemandFonts {
+    fontconfig: crate::fontconfig::Fontconfig,
+    files_read: collections::HashSet<std::path::PathBuf>,
+    families_looked_up: collections::HashSet<String>,
+    chars_looked_up: collections::HashSet<char>,
+}
+
+#[cfg(feature = "fontconfig")]
+impl OnDemandFonts {
+    fn new(fontconfig: crate::fontconfig::Fontconfig) -> Self {
+        Self {
+            fontconfig,
+            files_read: Default::default(),
+            families_looked_up: Default::default(),
+            chars_looked_up: Default::default(),
+        }
+    }
+
+    fn load_family(&mut self, font_system: &mut FontSystem, family: &str) {
+        if !self.families_looked_up.insert(family.to_string()) {
+            return;
+        }
+        for file in self.fontconfig.family_files(family) {
+            self.read_file(font_system, file);
+        }
+    }
+
+    #[profiling::function]
+    fn load_fonts_for_text(&mut self, font_system: &mut FontSystem, text: &str) {
+        for ch in text.chars() {
+            if needs_no_font(ch) || !self.chars_looked_up.insert(ch) {
+                continue;
+            }
+            if font_system_has_char(font_system, ch) {
+                continue;
+            }
+            if let Some(file) = self.fontconfig.file_for_char(ch) {
+                self.read_file(font_system, file);
+            }
+        }
+    }
+
+    fn family_names(&mut self) -> Vec<String> {
+        self.fontconfig.family_names()
+    }
+
+    fn read_file(&mut self, font_system: &mut FontSystem, file: std::path::PathBuf) {
+        if self.files_read.contains(&file) {
+            return;
+        }
+        if let Err(error) = font_system.db_mut().load_font_file(&file) {
+            log::warn!("could not read font file {}: {error}", file.display());
+        }
+        self.files_read.insert(file);
+    }
+}
+
+/// Without fontconfig every system font is read at start, so there is
+/// nothing to read on demand.
+#[cfg(not(feature = "fontconfig"))]
+enum OnDemandFonts {}
+
+#[cfg(not(feature = "fontconfig"))]
+impl OnDemandFonts {
+    fn load_family(&mut self, _: &mut FontSystem, _: &str) {
+        match *self {}
+    }
+
+    fn load_fonts_for_text(&mut self, _: &mut FontSystem, _: &str) {
+        match *self {}
+    }
+
+    fn family_names(&mut self) -> Vec<String> {
+        match *self {}
+    }
+}
+
+/// Whether any font read so far draws `ch`.
+#[cfg(feature = "fontconfig")]
+fn font_system_has_char(font_system: &mut FontSystem, ch: char) -> bool {
+    let face_ids = font_system.db().faces().map(|face| face.id).collect_vec();
+    face_ids.into_iter().any(|id| {
+        font_system
+            .get_font(id, cosmic_text::Weight::NORMAL)
+            .is_some_and(|font| font.as_swash().charmap().map(ch) != 0)
+    })
+}
+
+/// Characters that shape to nothing visible (controls, joiners, variation
+/// selectors, tags), so looking up a font for them would read one for no
+/// reason.
+#[cfg(feature = "fontconfig")]
+fn needs_no_font(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+                | '\u{E0100}'..='\u{E01EF}'
+        )
+}
+
+#[cfg(all(test, feature = "fontconfig"))]
+mod tests {
+    use super::*;
+    use gpui::{font, px};
+
+    /// A family fontconfig knows, from a list that covers common desktops
+    /// and CI images; `None` when none is installed.
+    fn installed_ui_family(fontconfig: &mut crate::fontconfig::Fontconfig) -> Option<&'static str> {
+        [
+            "DejaVu Sans",
+            "Noto Sans",
+            "Cantarell",
+            "Liberation Sans",
+            "FreeSans",
+        ]
+        .into_iter()
+        .find(|family| !fontconfig.family_files(family).is_empty())
+    }
+
+    #[test]
+    fn reads_only_the_fonts_text_needs() {
+        let Some(mut fontconfig) = crate::fontconfig::Fontconfig::new() else {
+            return;
+        };
+        let Some(family) = installed_ui_family(&mut fontconfig) else {
+            return;
+        };
+        let system = CosmicTextSystem::new(family);
+        let font_id = system
+            .font_id(&font(family))
+            .expect("installed family resolves");
+
+        let state = system.state().read();
+        assert!(state.on_demand.is_some(), "fontconfig is used");
+        let files_read = state
+            .on_demand
+            .as_ref()
+            .map_or(0, |fonts| fonts.files_read.len());
+        assert!(
+            files_read <= fontconfig.family_files(family).len(),
+            "only the asked family was read, not every system font"
+        );
+        drop(state);
+
+        // Every character either draws from a font that has it, or no
+        // installed font has it at all.
+        let text = "Report 日本語 Ελληνικά 😀.pdf";
+        let layout = system.layout_line(
+            text,
+            px(14.),
+            &[FontRun {
+                len: text.len(),
+                font_id,
+            }],
+        );
+        let shaped = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(move |glyph| (run.font_id, glyph)));
+        for (run_font, glyph) in shaped {
+            let ch = text[glyph.index..]
+                .chars()
+                .next()
+                .expect("glyph maps to a character");
+            if ch == ' ' || fontconfig.file_for_char(ch).is_none() {
+                continue;
+            }
+            assert!(
+                system.glyph_for_char(run_font, ch).is_some(),
+                "{ch:?} is drawn from a font that has it"
+            );
+        }
+    }
 }
