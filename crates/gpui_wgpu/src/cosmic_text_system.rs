@@ -786,7 +786,7 @@ impl OnDemandFonts {
             if font_system_has_char(font_system, ch) {
                 continue;
             }
-            if let Some(file) = self.fontconfig.file_for_char(ch) {
+            if let Some(file) = self.fontconfig.file_for_char(ch, is_emoji(ch)) {
                 self.read_file(font_system, file);
             }
         }
@@ -836,6 +836,13 @@ fn font_system_has_char(font_system: &mut FontSystem, ch: char) -> bool {
             .get_font(id, cosmic_text::Weight::NORMAL)
             .is_some_and(|font| font.as_swash().charmap().map(ch) != 0)
     })
+}
+
+/// Characters from the emoji blocks (faces, symbols, flags), which should
+/// draw from a color emoji font even when a plain font also has them.
+#[cfg(feature = "fontconfig")]
+fn is_emoji(ch: char) -> bool {
+    matches!(ch, '\u{1F000}'..='\u{1FAFF}')
 }
 
 /// Characters that shape to nothing visible (controls, joiners, variation
@@ -902,7 +909,7 @@ mod tests {
 
         // Every character either draws from a font that has it, or no
         // installed font has it at all.
-        let text = "Report 日本語 Ελληνικά 😀.pdf";
+        let text = "Report 日本語 Ελληνικά 🎉.pdf";
         let layout = system.layout_line(
             text,
             px(14.),
@@ -920,13 +927,28 @@ mod tests {
                 .chars()
                 .next()
                 .expect("glyph maps to a character");
-            if ch == ' ' || fontconfig.file_for_char(ch).is_none() {
+            if ch == ' ' || fontconfig.file_for_char(ch, is_emoji(ch)).is_none() {
                 continue;
             }
             assert!(
                 system.glyph_for_char(run_font, ch).is_some(),
                 "{ch:?} is drawn from a font that has it"
             );
+        }
+
+        // Emoji draw in color when a color emoji font is installed.
+        let color_emoji_installed = fontconfig
+            .file_for_char('🎉', true)
+            .is_some_and(|file| file.ends_with("NotoColorEmoji.ttf"));
+        if color_emoji_installed {
+            let party = text.find('🎉').expect("text has the emoji");
+            let emoji_glyph = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter())
+                .find(|glyph| glyph.index == party)
+                .expect("emoji is shaped");
+            assert!(emoji_glyph.is_emoji, "emoji draws from the color font");
         }
     }
 }
