@@ -180,6 +180,7 @@ impl WgpuRenderer {
         let dual_source_blending = self.dual_source_blending;
         let resources = self.resources_mut();
         if resources.pipelines.is_none() {
+            crate::fil65_mark("pipelines build");
             resources.pipelines = Some(Self::create_pipelines(
                 &resources.device,
                 &resources.bind_group_layouts,
@@ -1063,6 +1064,18 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let first = FIRST.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if first {
+            crate::fil65_mark("first draw start");
+        }
+        self.draw_inner(scene);
+        if first {
+            crate::fil65_mark("first draw presented");
+        }
+    }
+
+    fn draw_inner(&mut self, scene: &Scene) {
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
         // a texture from an unconfigured surface can block indefinitely on
@@ -1836,9 +1849,12 @@ where
     W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
 {
     let create = |backends: wgpu::Backends| {
+        crate::fil65_mark(&format!("wgpu instance start {backends:?}"));
         let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
+        crate::fil65_mark("wgpu instance done");
         let surface = create_surface(&instance, raw_window_handle)?;
         let context = WgpuContext::new(instance, &surface, compositor_gpu)?;
+        crate::fil65_mark("wgpu context done");
         anyhow::Ok((context, surface))
     };
 

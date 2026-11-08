@@ -347,7 +347,10 @@ impl WaylandWindowState {
                 transparent: true,
                 preferred_present_mode: None,
             };
-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+            gpui_wgpu::fil65_mark("renderer start");
+            let renderer = WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?;
+            gpui_wgpu::fil65_mark("renderer done");
+            renderer
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {

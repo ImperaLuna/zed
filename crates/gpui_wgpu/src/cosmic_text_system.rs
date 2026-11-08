@@ -70,7 +70,12 @@ impl CosmicTextSystem {
     pub fn new(system_font_fallback: &str) -> Self {
         let spawned = std::thread::Builder::new()
             .name("gpui-load-fonts".to_string())
-            .spawn(FontSystem::new);
+            .spawn(|| {
+                crate::fil65_mark("fonts thread start");
+                let fonts = FontSystem::new();
+                crate::fil65_mark("fonts thread done");
+                fonts
+            });
         match spawned {
             std::result::Result::Ok(thread) => Self {
                 state: OnceLock::new(),
@@ -111,6 +116,7 @@ impl CosmicTextSystem {
                 .lock()
                 .take()
                 .expect("fonts are either loading or loaded");
+            crate::fil65_mark("first text call waits for fonts");
             let font_system = loading.thread.join().unwrap_or_else(|_| {
                 log::error!("loading the system fonts panicked; going on without them");
                 FontSystem::new_with_locale_and_db(
@@ -118,6 +124,7 @@ impl CosmicTextSystem {
                     cosmic_text::fontdb::Database::new(),
                 )
             });
+            crate::fil65_mark("fonts ready for first text call");
             RwLock::new(CosmicTextSystemState::new(
                 font_system,
                 loading.system_font_fallback,
