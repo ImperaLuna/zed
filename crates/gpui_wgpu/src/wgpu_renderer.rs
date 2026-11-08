@@ -108,7 +108,11 @@ struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
-    pipelines: WgpuPipelines,
+    /// Built by the first frame that draws, once the window has settled on
+    /// opaque or transparent, and dropped when that changes. A Wayland
+    /// window starts transparent and usually turns opaque before its first
+    /// frame, so building them up front compiled every shader twice.
+    pipelines: Option<WgpuPipelines>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
@@ -159,6 +163,32 @@ impl WgpuRenderer {
         self.resources
             .as_mut()
             .expect("GPU resources not available")
+    }
+
+    fn pipelines(&self) -> &WgpuPipelines {
+        self.resources()
+            .pipelines
+            .as_ref()
+            .expect("pipelines are built at the start of each frame")
+    }
+
+    /// Builds the pipelines for the current alpha mode, if they aren't yet.
+    fn ensure_pipelines(&mut self) {
+        let format = self.surface_config.format;
+        let alpha_mode = self.surface_config.alpha_mode;
+        let path_sample_count = self.rendering_params.path_sample_count;
+        let dual_source_blending = self.dual_source_blending;
+        let resources = self.resources_mut();
+        if resources.pipelines.is_none() {
+            resources.pipelines = Some(Self::create_pipelines(
+                &resources.device,
+                &resources.bind_group_layouts,
+                format,
+                alpha_mode,
+                path_sample_count,
+                dual_source_blending,
+            ));
+        }
     }
 
     /// Creates a new WgpuRenderer from raw window handles.
@@ -323,14 +353,6 @@ impl WgpuRenderer {
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
-        let pipelines = Self::create_pipelines(
-            &device,
-            &bind_group_layouts,
-            surface_format,
-            alpha_mode,
-            rendering_params.path_sample_count,
-            dual_source_blending,
-        );
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -421,7 +443,7 @@ impl WgpuRenderer {
             device,
             queue,
             surface,
-            pipelines,
+            pipelines: None,
             bind_group_layouts,
             atlas_sampler,
             globals_buffer,
@@ -1001,20 +1023,13 @@ impl WgpuRenderer {
         if new_alpha_mode != self.surface_config.alpha_mode {
             self.surface_config.alpha_mode = new_alpha_mode;
             let surface_config = self.surface_config.clone();
-            let path_sample_count = self.rendering_params.path_sample_count;
-            let dual_source_blending = self.dual_source_blending;
             let resources = self.resources_mut();
             resources
                 .surface
                 .configure(&resources.device, &surface_config);
-            resources.pipelines = Self::create_pipelines(
-                &resources.device,
-                &resources.bind_group_layouts,
-                surface_config.format,
-                surface_config.alpha_mode,
-                path_sample_count,
-                dual_source_blending,
-            );
+            // The blend state depends on the alpha mode; the next frame
+            // rebuilds them.
+            resources.pipelines = None;
         }
     }
 
@@ -1107,6 +1122,7 @@ impl WgpuRenderer {
         if !scene.paths.is_empty() {
             self.ensure_intermediate_textures();
         }
+        self.ensure_pipelines();
 
         let frame_view = frame
             .texture
@@ -1305,7 +1321,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             quads.len() as u32,
-            &self.resources().pipelines.quads,
+            &self.pipelines().quads,
             instance_offset,
             pass,
         )
@@ -1321,7 +1337,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             shadows.len() as u32,
-            &self.resources().pipelines.shadows,
+            &self.pipelines().shadows,
             instance_offset,
             pass,
         )
@@ -1337,7 +1353,7 @@ impl WgpuRenderer {
         self.draw_instances(
             data,
             underlines.len() as u32,
-            &self.resources().pipelines.underlines,
+            &self.pipelines().underlines,
             instance_offset,
             pass,
         )
@@ -1356,7 +1372,7 @@ impl WgpuRenderer {
             data,
             sprites.len() as u32,
             &tex_info.view,
-            &self.resources().pipelines.mono_sprites,
+            &self.pipelines().mono_sprites,
             instance_offset,
             pass,
         )
@@ -1371,12 +1387,11 @@ impl WgpuRenderer {
     ) -> bool {
         let tex_info = self.atlas.get_texture_info(texture_id);
         let data = unsafe { Self::instance_bytes(sprites) };
-        let resources = self.resources();
-        let pipeline = resources
-            .pipelines
+        let pipelines = self.pipelines();
+        let pipeline = pipelines
             .subpixel_sprites
             .as_ref()
-            .unwrap_or(&resources.pipelines.mono_sprites);
+            .unwrap_or(&pipelines.mono_sprites);
         self.draw_instances_with_texture(
             data,
             sprites.len() as u32,
@@ -1400,7 +1415,7 @@ impl WgpuRenderer {
             data,
             sprites.len() as u32,
             &tex_info.view,
-            &self.resources().pipelines.poly_sprites,
+            &self.pipelines().poly_sprites,
             instance_offset,
             pass,
         )
@@ -1523,7 +1538,7 @@ impl WgpuRenderer {
             sprite_data,
             sprites.len() as u32,
             path_intermediate_view,
-            &resources.pipelines.paths,
+            &self.pipelines().paths,
             instance_offset,
             pass,
         )
@@ -1595,7 +1610,7 @@ impl WgpuRenderer {
                 ..Default::default()
             });
 
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_pipeline(&self.pipelines().path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &data_bind_group, &[]);
             pass.draw(0..vertices.len() as u32, 0..1);
