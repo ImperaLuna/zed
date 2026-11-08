@@ -466,6 +466,7 @@ fn wl_output_version(version: u32) -> u32 {
 
 impl WaylandClient {
     pub(crate) fn new() -> Self {
+        gpui_wgpu::fil65_mark("wayland client start");
         let conn = Connection::connect_to_env().unwrap();
 
         let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
@@ -504,7 +505,9 @@ impl WaylandClient {
 
         let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
 
+        gpui_wgpu::fil65_mark("linux common start (fonts)");
         let (common, main_receiver) = LinuxCommon::new(event_loop.get_signal());
+        gpui_wgpu::fil65_mark("linux common done");
 
         let handle = event_loop.handle();
         handle
@@ -741,6 +744,7 @@ impl LinuxClient for WaylandClient {
         handle: AnyWindowHandle,
         params: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        gpui_wgpu::fil65_mark("wayland open_window start");
         let mut state = self.0.borrow_mut();
 
         let parent = state.keyboard_focused_window.clone();

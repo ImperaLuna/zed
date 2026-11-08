@@ -322,6 +322,7 @@ impl WgpuRenderer {
         let dual_source_blending = context.supports_dual_source_blending();
 
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
+        crate::fil65_mark("pipelines start");
         let bind_group_layouts = Self::create_bind_group_layouts(&device);
         let pipelines = Self::create_pipelines(
             &device,
@@ -331,6 +332,7 @@ impl WgpuRenderer {
             rendering_params.path_sample_count,
             dual_source_blending,
         );
+        crate::fil65_mark("pipelines done");
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -1048,6 +1050,18 @@ impl WgpuRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        let first = FIRST.swap(false, std::sync::atomic::Ordering::Relaxed);
+        if first {
+            crate::fil65_mark("first draw start");
+        }
+        self.draw_inner(scene);
+        if first {
+            crate::fil65_mark("first draw presented");
+        }
+    }
+
+    fn draw_inner(&mut self, scene: &Scene) {
         // Bail out early if the surface has been unconfigured (e.g. during
         // Android background/rotation transitions).  Attempting to acquire
         // a texture from an unconfigured surface can block indefinitely on
@@ -1821,9 +1835,13 @@ where
     W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
 {
     let create = |backends: wgpu::Backends| {
+        crate::fil65_mark(&format!("wgpu instance start {backends:?}"));
         let instance = WgpuContext::instance_with_backends(Box::new(window.clone()), backends);
+        crate::fil65_mark("wgpu instance done");
         let surface = create_surface(&instance, raw_window_handle)?;
+        crate::fil65_mark("wgpu surface done");
         let context = WgpuContext::new(instance, &surface, compositor_gpu)?;
+        crate::fil65_mark("wgpu context done");
         anyhow::Ok((context, surface))
     };
 

@@ -214,6 +214,7 @@ impl WgpuContext {
         TextureFormat,
     )> {
         let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+        crate::fil65_mark(&format!("enumerated {} adapters", adapters.len()));
 
         if adapters.is_empty() {
             anyhow::bail!("No GPU adapters found");
@@ -295,7 +296,10 @@ impl WgpuContext {
             let info = adapter.get_info();
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
-            match Self::try_adapter_with_surface(&adapter, surface).await {
+            crate::fil65_mark(&format!("try adapter {} {:?} {:?}", info.name, info.backend, info.device_type));
+            let tried = Self::try_adapter_with_surface(&adapter, surface).await;
+            crate::fil65_mark("try adapter done");
+            match tried {
                 Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
