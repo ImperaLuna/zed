@@ -60,6 +60,12 @@ mod prompts;
 use crate::util::atomic_incr_if_not_zero;
 pub use prompts::*;
 
+/// The log target of drawn frames. Each frame GPUI draws and presents is
+/// logged at debug level, right after present returns, with the frame's
+/// duration in nanoseconds (draw plus present), so an app can time its own
+/// frames.
+pub const FRAME_LOG_TARGET: &str = "gpui::frame";
+
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
 
@@ -1269,6 +1275,7 @@ impl Window {
                     || (active.get() && input_rate_tracker.borrow_mut().is_high_rate());
 
                 if invalidator.is_dirty() || request_frame_options.force_render {
+                    let frame_start = std::time::Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -1277,7 +1284,12 @@ impl Window {
                                 arena_clear_needed.clear();
                             })
                             .log_err();
-                    })
+                    });
+                    log::debug!(
+                        target: FRAME_LOG_TARGET,
+                        "{}",
+                        frame_start.elapsed().as_nanos()
+                    );
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
