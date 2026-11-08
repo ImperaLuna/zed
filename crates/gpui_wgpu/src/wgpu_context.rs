@@ -6,6 +6,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
 
+/// GPU memory block size for the device's sub-allocations (FIL-71).
+const DEVICE_MEMORY_BLOCK: u64 = 4 * 1024 * 1024;
+
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
     pub adapter: wgpu::Adapter,
@@ -145,7 +148,13 @@ impl WgpuContext {
                 required_limits: wgpu::Limits::downlevel_defaults()
                     .using_resolution(adapter.limits())
                     .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                // Nova Files (FIL-71): fixed 4 MiB blocks. `MemoryUsage` starts
+                // at 8 MiB and doubles each new block, so the first image
+                // atlas (4 MiB) made a 16 MiB block. 4 MiB is the allocator's
+                // smallest; bigger resources get a block of their own.
+                memory_hints: wgpu::MemoryHints::Manual {
+                    suballocated_device_memory_block_size: DEVICE_MEMORY_BLOCK..DEVICE_MEMORY_BLOCK,
+                },
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
