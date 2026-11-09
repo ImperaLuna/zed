@@ -1429,6 +1429,21 @@ pub struct WindowOptions {
 
     /// Tab group name, allows opening the window as a native tab on macOS 10.12+. Windows with the same tabbing identifier will be grouped together.
     pub tabbing_identifier: Option<String>,
+
+    /// A window of another program to open this one over, such as the app a
+    /// file dialog was opened for (Linux only). Ignored when the window
+    /// system can't do it or the handle no longer names a window.
+    pub foreign_parent: Option<ForeignParent>,
+}
+
+/// A window of another program, as named across processes, for example by
+/// xdg-desktop-portal's `parent_window`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignParent {
+    /// A handle exported through the xdg-foreign protocol.
+    Wayland(String),
+    /// An X11 window id.
+    X11(u32),
 }
 
 /// The variables that can be configured when creating a new window
@@ -1483,6 +1498,9 @@ pub struct WindowParams {
     pub window_min_size: Option<Size<Pixels>>,
     #[cfg(target_os = "macos")]
     pub tabbing_identifier: Option<String>,
+
+    #[cfg_attr(not(any(target_os = "linux", target_os = "freebsd")), allow(dead_code))]
+    pub foreign_parent: Option<ForeignParent>,
 }
 
 /// Represents the status of how a window should be opened.
@@ -1542,6 +1560,7 @@ impl Default for WindowOptions {
             window_min_size: None,
             window_decorations: None,
             tabbing_identifier: None,
+            foreign_parent: None,
         }
     }
 }

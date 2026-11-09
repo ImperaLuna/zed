@@ -23,6 +23,7 @@ use wayland_protocols::xdg::shell::client::xdg_toplevel::{self};
 use wayland_protocols::{
     wp::fractional_scale::v1::client::wp_fractional_scale_v1,
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
+    xdg::foreign::zv2::client::zxdg_imported_v2::ZxdgImportedV2,
 };
 use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
@@ -30,12 +31,12 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, GpuSpecs, Modifiers, Pixels,
-    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls,
-    WindowDecorations, WindowKind, WindowParams, layer_shell::LayerShellNotSupportedError, px,
-    size,
+    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ForeignParent, GpuSpecs,
+    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    layer_shell::LayerShellNotSupportedError, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -212,6 +213,18 @@ impl WaylandSurfaceState {
             None
         };
 
+        // Another program's window to open over. An unknown handle makes
+        // the compositor destroy the import, which leaves this window
+        // without a parent rather than failing it.
+        let foreign_parent = match (&params.foreign_parent, &globals.foreign_importer) {
+            (Some(ForeignParent::Wayland(handle)), Some(importer)) => {
+                let imported = importer.import_toplevel(handle.clone(), &globals.qh, ());
+                imported.set_parent_of(&surface);
+                Some(imported)
+            }
+            _ => None,
+        };
+
         if let Some(size) = params.window_min_size {
             toplevel.set_min_size(f32::from(size.width) as i32, f32::from(size.height) as i32);
         }
@@ -229,6 +242,7 @@ impl WaylandSurfaceState {
             toplevel,
             decoration,
             dialog,
+            foreign_parent,
         }))
     }
 }
@@ -238,6 +252,7 @@ pub struct WaylandXdgSurfaceState {
     toplevel: xdg_toplevel::XdgToplevel,
     decoration: Option<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1>,
     dialog: Option<XdgDialogV1>,
+    foreign_parent: Option<ZxdgImportedV2>,
 }
 
 pub struct WaylandLayerSurfaceState {
@@ -291,7 +306,12 @@ impl WaylandSurfaceState {
                 toplevel,
                 decoration: _decoration,
                 dialog,
+                foreign_parent,
             }) => {
+                if let Some(foreign_parent) = foreign_parent {
+                    foreign_parent.destroy();
+                }
+
                 // drop the dialog before toplevel so compositor can explicitly unapply it's effects
                 if let Some(dialog) = dialog {
                     dialog.destroy();

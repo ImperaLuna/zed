@@ -3,11 +3,11 @@ use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
 use gpui::{
-    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, px,
+    AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, ForeignParent,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -588,6 +588,25 @@ impl X11WindowState {
                             &[parent_window],
                         ),
                     )?;
+                }
+            }
+
+            // Another program's window to open over: transient for it, as
+            // for a parent of our own. A stale id only leaves this window
+            // without a parent, so a failure here doesn't fail the window.
+            if let Some(ForeignParent::X11(foreign)) = params.foreign_parent {
+                let set = check_reply(
+                    || "X11 ChangeProperty32 setting WM_TRANSIENT_FOR for a foreign parent failed.",
+                    xcb.change_property32(
+                        xproto::PropMode::REPLACE,
+                        x_window,
+                        atoms.WM_TRANSIENT_FOR,
+                        xproto::AtomEnum::WINDOW,
+                        &[foreign],
+                    ),
+                );
+                if let Err(error) = set {
+                    log::warn!("{error:#}");
                 }
             }
 

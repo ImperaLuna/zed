@@ -57,6 +57,7 @@ use wayland_protocols::xdg::activation::v1::client::{xdg_activation_token_v1, xd
 use wayland_protocols::xdg::decoration::zv1::client::{
     zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1,
 };
+use wayland_protocols::xdg::foreign::zv2::client::{zxdg_imported_v2, zxdg_importer_v2};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 use wayland_protocols::xdg::system_bell::v1::client::xdg_system_bell_v1;
 use wayland_protocols::{
@@ -131,6 +132,7 @@ pub struct Globals {
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
+    pub foreign_importer: Option<zxdg_importer_v2::ZxdgImporterV2>,
     pub executor: ForegroundExecutor,
 }
 
@@ -173,6 +175,7 @@ impl Globals {
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
+            foreign_importer: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
             qh,
         }
@@ -2462,6 +2465,32 @@ impl Dispatch<XdgWmDialogV1, ()> for WaylandClientStatePtr {
         _: &mut Self,
         _: &XdgWmDialogV1,
         _: <XdgWmDialogV1 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<zxdg_importer_v2::ZxdgImporterV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_importer_v2::ZxdgImporterV2,
+        _: <zxdg_importer_v2::ZxdgImporterV2 as Proxy>::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+// An imported parent that goes away only stops being our parent; the
+// window carries on.
+impl Dispatch<zxdg_imported_v2::ZxdgImportedV2, ()> for WaylandClientStatePtr {
+    fn event(
+        _: &mut Self,
+        _: &zxdg_imported_v2::ZxdgImportedV2,
+        _: <zxdg_imported_v2::ZxdgImportedV2 as Proxy>::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
