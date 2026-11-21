@@ -16,6 +16,9 @@ doctest = false
 default = []
 bench-support = ["gpui/bench-support", "dep:image"]
 font-kit = ["dep:font-kit"]
+# Find font files through fontconfig and read only the fonts that are used,
+# instead of every system font at start-up.
+fontconfig = ["dep:yeslogic-fontconfig-sys", "dep:sys-locale"]
 test-support = ["gpui/test-support", "dep:image"]
 
 [dependencies]
@@ -40,6 +43,10 @@ gpui_util.workspace = true
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)
 # WARNING: If you change this, you must also publish a new version of zed-font-kit to crates.io
 font-kit = { workspace = true, optional = true }
+
+# Linked, not opened at run time: the `dlopen` feature is not supported.
+yeslogic-fontconfig-sys = { version = "6.0", optional = true }
+sys-locale = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
 wgpu = { workspace = true, features = ["std", "metal", "gles", "vulkan", "wgsl", "webgpu"] }
