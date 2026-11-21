@@ -1,9 +1,9 @@
 use crate::{
     BackGestureEvent, Bounds, Capslock, Context, Empty, IntoElement, Keystroke, LongPressEvent,
-    Modifiers, Pixels, Point, Render, TouchDragEvent, Window, point, seal::Sealed,
+    Modifiers, Pixels, Point, Render, RenderImage, TouchDragEvent, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf, sync::Arc};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -732,17 +732,58 @@ pub enum ExternalDragPayload {
 /// Paths handed to the platform for a native file drag. Directory metadata is
 /// provided by the caller to avoid querying it when the platform drag starts.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct FileDragPaths(SmallVec<[(PathBuf, bool); 2]>);
+pub struct FileDragPaths {
+    entries: SmallVec<[(PathBuf, bool); 2]>,
+    picture: Option<DragPicture>,
+}
 
 impl FileDragPaths {
     /// Creates a native file-drag payload from paths paired with whether each path is a directory.
     pub fn new(entries: impl IntoIterator<Item = (PathBuf, bool)>) -> Self {
-        Self(entries.into_iter().collect())
+        Self {
+            entries: entries.into_iter().collect(),
+            picture: None,
+        }
+    }
+
+    /// Shows the given picture beside the pointer while the native drag lasts.
+    pub fn with_picture(mut self, picture: DragPicture) -> Self {
+        self.picture = Some(picture);
+        self
     }
 
     /// The dragged paths, each paired with whether it is a directory.
     pub fn entries(&self) -> &[(PathBuf, bool)] {
-        &self.0
+        &self.entries
+    }
+
+    /// The picture shown beside the pointer, if any.
+    pub fn picture(&self) -> Option<&DragPicture> {
+        self.picture.as_ref()
+    }
+}
+
+/// A picture that follows the pointer during a native drag. Platforms that
+/// can't show one ignore it.
+#[derive(Clone, Eq, PartialEq)]
+pub struct DragPicture {
+    /// The pixels, drawn at `scale` device pixels per logical pixel.
+    pub image: Arc<RenderImage>,
+    /// How many device pixels the image holds per logical pixel.
+    pub scale: u32,
+    /// Where the image's top-left corner sits, relative to the pointer.
+    pub offset: Point<Pixels>,
+}
+
+impl Debug for DragPicture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DragPicture")
+            .field("image", &self.image.id)
+            .field("size", &self.image.size(0))
+            .field("scale", &self.scale)
+            .field("offset", &self.offset)
+            .finish()
     }
 }
 

@@ -96,6 +96,7 @@ use crate::linux::{
     wayland::{
         clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
         cursor::Cursor,
+        drag_icon::DragIcon,
         serial::{ActivationContext, Serial, SerialKind, SerialTracker},
         to_shape,
         window::WaylandWindow,
@@ -523,6 +524,7 @@ pub(crate) enum DataSourceKind {
 
 pub(crate) struct ExternalDrag {
     source: wl_data_source::WlDataSource,
+    icon: Option<DragIcon>,
     bytes: Vec<u8>,
     window: WaylandWindowStatePtr,
 }
@@ -703,10 +705,22 @@ impl WaylandClientStatePtr {
             data_device_manager.create_data_source(&state.globals.qh, DataSourceKind::Drag);
         source.offer(FILE_LIST_MIME_TYPE.to_string());
         source.set_actions(DndAction::Copy | DndAction::Move);
-        data_device.start_drag(Some(&source), surface, None, serial.as_raw());
+        let icon = paths
+            .picture()
+            .and_then(|picture| DragIcon::new(&state.globals, picture).log_err());
+        data_device.start_drag(
+            Some(&source),
+            surface,
+            icon.as_ref().map(DragIcon::surface),
+            serial.as_raw(),
+        );
+        if let (Some(icon), Some(picture)) = (icon.as_ref(), paths.picture()) {
+            icon.show(picture);
+        }
 
         state.external_drag = Some(ExternalDrag {
             source,
+            icon,
             bytes: uri_list.into_bytes(),
             window,
         });
@@ -3066,6 +3080,9 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                     return;
                 };
                 external_drag.source.destroy();
+                if let Some(icon) = external_drag.icon {
+                    icon.destroy();
+                }
 
                 let input = PlatformInput::FileDrop(FileDropEvent::Ended);
                 drop(state);
