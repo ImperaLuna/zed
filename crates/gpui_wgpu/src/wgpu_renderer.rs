@@ -302,45 +302,24 @@ impl WgpuRenderer {
             .window_handle()
             .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
 
-        let target = wgpu::SurfaceTargetUnsafe::RawHandle {
-            // Fall back to the display handle already provided via InstanceDescriptor::display.
-            raw_display_handle: None,
-            raw_window_handle: window_handle.as_raw(),
-        };
-
-        // Use the existing context's instance if available, otherwise create a new one.
-        // The surface must be created with the same instance that will be used for
-        // adapter selection, otherwise wgpu will panic.
-        let instance = gpu_context
-            .borrow()
-            .as_ref()
-            .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| {
-                let instance = WgpuContext::instance(Some(Box::new(window.clone())));
-                crate::startup_phase("vulkan-instance");
-                instance
-            });
-
-        // Safety: The caller guarantees that the window handle is valid for the
-        // lifetime of this renderer. In practice, the RawWindow struct is created
-        // from the native window handles and the surface is dropped before the window.
-        let surface = unsafe {
-            instance
-                .create_surface_unsafe(target)
-                .map_err(|e| anyhow::anyhow!("Failed to create surface: {e}"))?
-        };
-
         let mut ctx_ref = gpu_context.borrow_mut();
         let surface_configured = ctx_ref.is_none();
-        let context = match ctx_ref.as_mut() {
+        let (context, surface) = match ctx_ref.as_mut() {
             Some(context) => {
+                // The surface must be created with the same instance that was
+                // used for adapter selection, otherwise wgpu will panic.
+                let surface = create_surface(&context.instance, window_handle.as_raw())?;
                 context.check_compatible_with_surface(&surface)?;
-                context
+                (context, surface)
             }
             None => {
-                let context = WgpuContext::new(instance, &surface, &config, compositor_gpu)?;
-                crate::startup_phase("gpu-device");
-                ctx_ref.insert(context)
+                let (context, surface) = create_context_and_surface(
+                    window,
+                    window_handle.as_raw(),
+                    &config,
+                    compositor_gpu,
+                )?;
+                (ctx_ref.insert(context), surface)
             }
         };
 
@@ -2584,6 +2563,49 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 
 fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
+}
+
+/// Builds a GPU context and surface, trying hardware Vulkan on its own first.
+///
+/// The GL backend (and the system's whole OpenGL driver stack) is only loaded
+/// if Vulkan cannot configure the surface on a hardware adapter. The fallback
+/// keeps the existing adapter ranking, so hardware OpenGL still wins over
+/// software Vulkan.
+#[cfg(not(target_family = "wasm"))]
+fn create_context_and_surface<W>(
+    window: &W,
+    raw_window_handle: raw_window_handle::RawWindowHandle,
+    config: &WgpuSurfaceConfig,
+    compositor_gpu: Option<CompositorGpuHint>,
+) -> anyhow::Result<(WgpuContext, wgpu::Surface<'static>)>
+where
+    W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
+{
+    let create = |backends: wgpu::Backends, reject_software: bool| {
+        let instance =
+            WgpuContext::instance_with_backends(Some(Box::new(window.clone())), backends);
+        crate::startup_phase("vulkan-instance");
+        let surface = create_surface(&instance, raw_window_handle)?;
+        let context = if reject_software {
+            WgpuContext::new_rejecting_software(instance, &surface, config, compositor_gpu)?
+        } else {
+            WgpuContext::new(instance, &surface, config, compositor_gpu)?
+        };
+        crate::startup_phase("gpu-device");
+        anyhow::Ok((context, surface))
+    };
+
+    let vulkan_err = match create(wgpu::Backends::VULKAN, true) {
+        Ok(result) => return Ok(result),
+        Err(err) => err,
+    };
+    log::warn!("Hardware Vulkan initialization failed ({vulkan_err:#}); enabling OpenGL fallback");
+
+    create(wgpu::Backends::VULKAN | wgpu::Backends::GL, false).map_err(|fallback_err| {
+        anyhow::anyhow!(
+            "Hardware Vulkan failed: {vulkan_err:#}; Vulkan/OpenGL fallback failed: {fallback_err:#}"
+        )
+    })
 }
 
 #[cfg(not(target_family = "wasm"))]
