@@ -17,9 +17,10 @@ use fontconfig_sys::{
     FcCharSet, FcCharSetAddChar, FcCharSetCreate, FcCharSetDestroy, FcCharSetHasChar, FcConfig,
     FcConfigDestroy, FcConfigSubstitute, FcDefaultSubstitute, FcFontList, FcFontSet,
     FcFontSetDestroy, FcFontSort, FcInitLoadConfigAndFonts, FcMatchPattern, FcObjectSetAdd,
-    FcObjectSetCreate, FcObjectSetDestroy, FcPattern, FcPatternAddCharSet, FcPatternAddString,
-    FcPatternCreate, FcPatternDestroy, FcPatternGetCharSet, FcPatternGetString, FcResultMatch,
-    constants::{FC_CHARSET, FC_FAMILY, FC_FILE},
+    FcObjectSetCreate, FcObjectSetDestroy, FcPattern, FcPatternAddBool, FcPatternAddCharSet,
+    FcPatternAddString, FcPatternCreate, FcPatternDestroy, FcPatternGetCharSet, FcPatternGetString,
+    FcResultMatch,
+    constants::{FC_CHARSET, FC_COLOR, FC_FAMILY, FC_FILE},
 };
 
 /// A loaded fontconfig configuration with its font cache.
@@ -76,14 +77,17 @@ impl Fontconfig {
     }
 
     /// The file fontconfig picks to draw `ch`, following the user's
-    /// configuration (preferred fonts, language). `None` when no installed
-    /// font has the character.
-    pub(crate) fn file_for_char(&mut self, ch: char) -> Option<PathBuf> {
+    /// configuration (preferred fonts, language). `color` prefers a color
+    /// font, for emoji. `None` when no installed font has the character.
+    pub(crate) fn file_for_char(&mut self, ch: char, color: bool) -> Option<PathBuf> {
         let pattern = Pattern::new()?;
         let charset = CharSet::new(ch)?;
         // SAFETY: pattern and charset are live; fontconfig copies the charset.
         unsafe {
             FcPatternAddCharSet(pattern.0, FC_CHARSET.as_ptr(), charset.0);
+            if color {
+                FcPatternAddBool(pattern.0, FC_COLOR.as_ptr(), 1);
+            }
             FcConfigSubstitute(self.config, pattern.0, FcMatchPattern);
             FcDefaultSubstitute(pattern.0);
         }
