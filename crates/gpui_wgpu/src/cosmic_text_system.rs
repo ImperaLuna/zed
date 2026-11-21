@@ -12,16 +12,32 @@ use gpui::{
 };
 
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use smallvec::SmallVec;
-use std::{borrow::Cow, ops::Range, sync::Arc};
+use std::{
+    borrow::Cow,
+    ops::Range,
+    sync::{Arc, OnceLock},
+    thread::JoinHandle,
+};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
     zeno::{Format, Vector},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-pub struct CosmicTextSystem(RwLock<CosmicTextSystemState>);
+pub struct CosmicTextSystem {
+    state: OnceLock<RwLock<CosmicTextSystemState>>,
+    /// Reading every system font takes a while, most of all on a cold start,
+    /// so `new` starts it on its own thread and the first text call waits
+    /// for it. Meanwhile the platform connects and sets up the GPU.
+    loading: Mutex<Option<LoadingFonts>>,
+}
+
+struct LoadingFonts {
+    thread: JoinHandle<FontSystem>,
+    system_font_fallback: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FontKey {
@@ -97,7 +113,7 @@ impl CosmicTextSystem {
         &self,
         font_id: FontId,
     ) -> Result<(gpui::FontWeight, gpui::FontStyle)> {
-        let state = self.0.read();
+        let state = self.state().read();
         let font = state
             .loaded_fonts
             .get(font_id.0)
@@ -123,26 +139,34 @@ impl CosmicTextSystem {
         font_runs: &[FontRun],
         missing_text_indices: impl IntoIterator<Item = usize>,
     ) -> Vec<MissingGlyph> {
-        self.0
+        self.state()
             .read()
             .missing_glyphs(text, font_runs, missing_text_indices)
     }
 
     pub fn new(system_font_fallback: &str) -> Self {
-        let font_system = FontSystem::new();
-        crate::startup_phase("fonts-ready");
-
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+        let spawned = std::thread::Builder::new()
+            .name("gpui-load-fonts".to_string())
+            .spawn(|| {
+                let font_system = FontSystem::new();
+                crate::startup_phase("fonts-ready");
+                font_system
+            });
+        match spawned {
+            std::result::Result::Ok(thread) => Self {
+                state: OnceLock::new(),
+                loading: Mutex::new(Some(LoadingFonts {
+                    thread,
+                    system_font_fallback: system_font_fallback.to_string(),
+                })),
+            },
+            Err(error) => {
+                log::warn!("could not start the font loading thread: {error}");
+                let font_system = FontSystem::new();
+                crate::startup_phase("fonts-ready");
+                Self::with_font_system(font_system, system_font_fallback)
+            }
+        }
     }
 
     pub fn new_without_system_fonts(system_font_fallback: &str) -> Self {
@@ -150,33 +174,53 @@ impl CosmicTextSystem {
             "en-US".to_string(),
             cosmic_text::fontdb::Database::new(),
         );
+        Self::with_font_system(font_system, system_font_fallback)
+    }
 
-        Self(RwLock::new(CosmicTextSystemState {
-            font_system,
-            scratch: ShapeBuffer::default(),
-            swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
-            loaded_fonts: Vec::new(),
-            loaded_font_ids_by_key: HashMap::default(),
-            font_ids_by_family_cache: HashMap::default(),
-            system_font_fallback: system_font_fallback.to_string(),
-            missing_glyph_sink: None,
-        }))
+    fn with_font_system(font_system: FontSystem, system_font_fallback: &str) -> Self {
+        Self {
+            state: OnceLock::from(RwLock::new(CosmicTextSystemState::new(
+                font_system,
+                system_font_fallback.to_string(),
+            ))),
+            loading: Mutex::new(None),
+        }
+    }
+
+    fn state(&self) -> &RwLock<CosmicTextSystemState> {
+        self.state.get_or_init(|| {
+            let loading = self
+                .loading
+                .lock()
+                .take()
+                .expect("fonts are either loading or loaded");
+            let font_system = loading.thread.join().unwrap_or_else(|_| {
+                log::error!("loading the system fonts panicked; going on without them");
+                FontSystem::new_with_locale_and_db(
+                    "en-US".to_string(),
+                    cosmic_text::fontdb::Database::new(),
+                )
+            });
+            RwLock::new(CosmicTextSystemState::new(
+                font_system,
+                loading.system_font_fallback,
+            ))
+        })
     }
 }
 
 impl PlatformTextSystem for CosmicTextSystem {
     fn add_fonts(&self, fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
-        self.0.write().add_fonts(fonts)
+        self.state().write().add_fonts(fonts)
     }
 
     fn set_missing_glyph_sink(&self, sink: Option<Arc<dyn MissingGlyphSink>>) {
-        self.0.write().missing_glyph_sink = sink;
+        self.state().write().missing_glyph_sink = sink;
     }
 
     fn all_font_names(&self) -> Vec<String> {
         let mut result = self
-            .0
+            .state()
             .read()
             .font_system
             .db()
@@ -189,7 +233,7 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn font_id(&self, font: &Font) -> Result<FontId> {
-        let mut state = self.0.write();
+        let mut state = self.state().write();
         let key = FontKey::new(
             font.family.clone(),
             font.features.clone(),
@@ -210,12 +254,12 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
-        self.0.write().prewarm_fonts(font_ids);
+        self.state().write().prewarm_fonts(font_ids);
     }
 
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         let metrics = self
-            .0
+            .state()
             .read()
             .loaded_font(font_id)
             .font
@@ -239,7 +283,7 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
-        let lock = self.0.read();
+        let lock = self.state().read();
         let glyph_metrics = lock.loaded_font(font_id).font.as_swash().glyph_metrics(&[]);
         let glyph_id = glyph_id.0 as u16;
         Ok(Bounds {
@@ -252,15 +296,15 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
-        self.0.read().advance(font_id, glyph_id)
+        self.state().read().advance(font_id, glyph_id)
     }
 
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId> {
-        self.0.read().glyph_for_char(font_id, ch)
+        self.state().read().glyph_for_char(font_id, ch)
     }
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
-        self.0.write().raster_bounds(params)
+        self.state().write().raster_bounds(params)
     }
 
     fn rasterize_glyph(
@@ -268,11 +312,11 @@ impl PlatformTextSystem for CosmicTextSystem {
         params: &RenderGlyphParams,
         raster_bounds: Bounds<DevicePixels>,
     ) -> Result<(Size<DevicePixels>, Vec<u8>)> {
-        self.0.write().rasterize_glyph(params, raster_bounds)
+        self.state().write().rasterize_glyph(params, raster_bounds)
     }
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
-        self.0.write().layout_line(text, font_size, runs)
+        self.state().write().layout_line(text, font_size, runs)
     }
 
     fn recommended_rendering_mode(
@@ -285,6 +329,20 @@ impl PlatformTextSystem for CosmicTextSystem {
 }
 
 impl CosmicTextSystemState {
+    fn new(font_system: FontSystem, system_font_fallback: String) -> Self {
+        Self {
+            font_system,
+            scratch: ShapeBuffer::default(),
+            swash_scale_context: ScaleContext::new(),
+            pending_glyph_images: HashMap::default(),
+            loaded_fonts: Vec::new(),
+            loaded_font_ids_by_key: HashMap::default(),
+            font_ids_by_family_cache: HashMap::default(),
+            system_font_fallback,
+            missing_glyph_sink: None,
+        }
+    }
+
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
     }
@@ -1286,13 +1344,15 @@ mod tests {
             let (sender, receiver) = mpsc::channel();
 
             thread::scope(|scope| {
-                let backend = platform_text_system.0.read();
+                let backend = platform_text_system.state().read();
                 let deadline = Instant::now() + Duration::from_secs(5);
                 let cold = scope.spawn(|| text_system.resolve_font(&cached.clone().bold()));
-                while !platform_text_system.0.is_locked_exclusive() && Instant::now() < deadline {
+                while !platform_text_system.state().is_locked_exclusive()
+                    && Instant::now() < deadline
+                {
                     thread::yield_now();
                 }
-                let cold_waiting = platform_text_system.0.is_locked_exclusive();
+                let cold_waiting = platform_text_system.state().is_locked_exclusive();
                 let warm = scope.spawn(|| sender.send(text_system.resolve_font(&cached)));
                 let result =
                     receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()));
@@ -1467,7 +1527,7 @@ mod tests {
         }];
 
         let missing_glyphs = text_system
-            .0
+            .state()
             .read()
             .missing_glyphs(text, &runs, [0, "x".len()]);
 
@@ -1495,7 +1555,7 @@ mod tests {
             &**first_layout,
             &**cached_layout
         ));
-        let loaded_font_count = platform_text_system.0.read().loaded_fonts.len();
+        let loaded_font_count = platform_text_system.state().read().loaded_fonts.len();
 
         text_system.add_fonts(vec![Cow::Borrowed(LILEX)])?;
 
@@ -1505,7 +1565,7 @@ mod tests {
             &**refreshed_layout
         ));
         assert_eq!(
-            platform_text_system.0.read().loaded_fonts.len(),
+            platform_text_system.state().read().loaded_fonts.len(),
             loaded_font_count
         );
         Ok(())
