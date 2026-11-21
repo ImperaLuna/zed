@@ -182,7 +182,11 @@ enum InstanceData {
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    pipelines: WgpuPipelines,
+    /// Built by the first frame that draws, once the window has settled on
+    /// opaque or transparent, and dropped when that changes. A Wayland
+    /// window starts transparent and usually turns opaque before its first
+    /// frame, so building them up front compiled every shader twice.
+    pipelines: Option<WgpuPipelines>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
@@ -202,6 +206,12 @@ struct CachedTextureBindGroup {
 }
 
 impl WgpuResources {
+    fn pipelines(&self) -> &WgpuPipelines {
+        self.pipelines
+            .as_ref()
+            .expect("pipelines are built at the start of each frame")
+    }
+
     fn invalidate_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
@@ -224,6 +234,7 @@ struct WgpuRendererCore {
     dual_source_blending: bool,
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
     max_texture_size: u32,
 }
 
@@ -1073,21 +1084,12 @@ impl WgpuRenderer {
             return;
         }
         self.surface_config.alpha_mode = new_alpha_mode;
-        let format = self.surface_config.format;
 
         let Some(core) = self.core_mut() else {
             return;
         };
-        let resources = &mut core.resources;
-        resources.pipelines = WgpuRendererCore::create_pipelines(
-            &resources.device,
-            &resources.bind_group_layouts,
-            format,
-            new_alpha_mode,
-            core.rendering_params.path_sample_count,
-            core.dual_source_blending,
-            core.uses_webgl_instance_data,
-        );
+        core.alpha_mode = new_alpha_mode;
+        core.resources.pipelines = None;
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1234,15 +1236,6 @@ impl WgpuRendererCore {
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
         let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
-        let pipelines = Self::create_pipelines(
-            &device,
-            &bind_group_layouts,
-            target_format,
-            alpha_mode,
-            rendering_params.path_sample_count,
-            dual_source_blending,
-            uses_webgl_instance_data,
-        );
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1349,7 +1342,7 @@ impl WgpuRendererCore {
             resources: WgpuResources {
                 device,
                 queue,
-                pipelines,
+                pipelines: None,
                 bind_group_layouts,
                 atlas_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
@@ -1374,6 +1367,7 @@ impl WgpuRendererCore {
             dual_source_blending,
             adapter_info: context.adapter.get_info(),
             target_format,
+            alpha_mode,
             max_texture_size,
         }
     }
@@ -1388,6 +1382,22 @@ impl WgpuRendererCore {
 
     /// Path rendering goes through an intermediate texture that must match the frame
     /// target's dimensions, so the textures are keyed by size and rebuilt on mismatch.
+    fn ensure_pipelines(&mut self) {
+        if self.resources.pipelines.is_some() {
+            return;
+        }
+        let resources = &mut self.resources;
+        resources.pipelines = Some(Self::create_pipelines(
+            &resources.device,
+            &resources.bind_group_layouts,
+            self.target_format,
+            self.alpha_mode,
+            self.rendering_params.path_sample_count,
+            self.dual_source_blending,
+            self.uses_webgl_instance_data,
+        ));
+    }
+
     fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
         let width = size.width.0 as u32;
         let height = size.height.0 as u32;
@@ -1442,6 +1452,7 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
+        self.ensure_pipelines();
         if !scene.paths.is_empty() {
             self.ensure_intermediate_textures(size);
         }
@@ -1535,13 +1546,13 @@ impl WgpuRendererCore {
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
                         &instance_bindings.quads,
-                        &self.resources().pipelines.quads,
+                        &self.resources().pipelines().quads,
                         instance_range(range),
                         &mut pass,
                     ),
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
-                        &self.resources().pipelines.shadows,
+                        &self.resources().pipelines().shadows,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1583,7 +1594,7 @@ impl WgpuRendererCore {
                     }
                     PrimitiveBatch::Underlines(range) => self.draw_instances(
                         &instance_bindings.underlines,
-                        &self.resources().pipelines.underlines,
+                        &self.resources().pipelines().underlines,
                         instance_range(range),
                         &mut pass,
                     ),
@@ -1591,7 +1602,7 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.monochrome_sprites,
                             texture_id,
-                            &self.resources().pipelines.mono_sprites,
+                            &self.resources().pipelines().mono_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -1602,10 +1613,10 @@ impl WgpuRendererCore {
                             &instance_bindings.subpixel_sprites,
                             texture_id,
                             resources
-                                .pipelines
+                                .pipelines()
                                 .subpixel_sprites
                                 .as_ref()
-                                .unwrap_or(&resources.pipelines.mono_sprites),
+                                .unwrap_or(&resources.pipelines().mono_sprites),
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -1614,7 +1625,7 @@ impl WgpuRendererCore {
                         self.draw_sprites(
                             &instance_bindings.polychrome_sprites,
                             texture_id,
-                            &self.resources().pipelines.poly_sprites,
+                            &self.resources().pipelines().poly_sprites,
                             instance_range(range),
                             &mut pass,
                         )?;
@@ -1832,7 +1843,7 @@ impl WgpuRendererCore {
             &path_intermediate_view,
         );
         let resources = self.resources();
-        pass.set_pipeline(&resources.pipelines.paths);
+        pass.set_pipeline(&resources.pipelines().paths);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
         pass.set_bind_group(2, &texture, &[]);
@@ -1897,7 +1908,7 @@ impl WgpuRendererCore {
                 ..Default::default()
             });
 
-            pass.set_pipeline(&resources.pipelines.path_rasterization);
+            pass.set_pipeline(&resources.pipelines().path_rasterization);
             pass.set_bind_group(0, &resources.path_globals_bind_group, &[]);
             pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
             // The path rasterization shader loads records by vertex index
