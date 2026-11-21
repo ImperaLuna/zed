@@ -81,6 +81,12 @@ use crate::util::{
 };
 pub use prompts::*;
 
+/// The log target of drawn frames. Each frame GPUI draws and presents is
+/// logged at debug level, right after present returns, with the frame's
+/// duration in nanoseconds (draw plus present), so an app can time its own
+/// frames.
+pub const FRAME_LOG_TARGET: &str = "gpui::frame";
+
 /// Default window size used when no explicit size is provided.
 pub const DEFAULT_WINDOW_SIZE: Size<Pixels> = size(px(1536.), px(1095.));
 
@@ -2027,6 +2033,7 @@ impl Window {
                     || needs_present.get()
                     || high_rate_input;
                 if should_draw {
+                    let frame_start = std::time::Instant::now();
                     measure("frame duration", || {
                         handle
                             .update(&mut cx, |_, window, cx| {
@@ -2050,7 +2057,12 @@ impl Window {
                                 )
                             })
                             .log_err();
-                    })
+                    });
+                    log::debug!(
+                        target: FRAME_LOG_TARGET,
+                        "{}",
+                        frame_start.elapsed().as_nanos()
+                    );
                 } else if needs_present {
                     handle
                         .update(&mut cx, |_, window, _| window.present())
