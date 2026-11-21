@@ -1463,7 +1463,9 @@ impl WgpuRendererCore {
         );
 
         self.atlas.before_frame();
-        self.ensure_intermediate_textures(size);
+        if !scene.paths.is_empty() {
+            self.ensure_intermediate_textures(size);
+        }
 
         let gamma_params = GammaParams {
             gamma_ratios: self.rendering_params.gamma_ratios,
