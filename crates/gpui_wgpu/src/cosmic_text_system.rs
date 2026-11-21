@@ -130,6 +130,7 @@ impl CosmicTextSystem {
 
     pub fn new(system_font_fallback: &str) -> Self {
         let font_system = FontSystem::new();
+        crate::startup_phase("fonts-ready");
 
         Self(RwLock::new(CosmicTextSystemState {
             font_system,

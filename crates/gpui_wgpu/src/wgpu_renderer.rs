@@ -315,7 +315,11 @@ impl WgpuRenderer {
             .borrow()
             .as_ref()
             .map(|ctx| ctx.instance.clone())
-            .unwrap_or_else(|| WgpuContext::instance(Some(Box::new(window.clone()))));
+            .unwrap_or_else(|| {
+                let instance = WgpuContext::instance(Some(Box::new(window.clone())));
+                crate::startup_phase("vulkan-instance");
+                instance
+            });
 
         // Safety: The caller guarantees that the window handle is valid for the
         // lifetime of this renderer. In practice, the RawWindow struct is created
@@ -333,12 +337,11 @@ impl WgpuRenderer {
                 context.check_compatible_with_surface(&surface)?;
                 context
             }
-            None => ctx_ref.insert(WgpuContext::new(
-                instance,
-                &surface,
-                &config,
-                compositor_gpu,
-            )?),
+            None => {
+                let context = WgpuContext::new(instance, &surface, &config, compositor_gpu)?;
+                crate::startup_phase("gpu-device");
+                ctx_ref.insert(context)
+            }
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
@@ -1232,6 +1235,8 @@ impl WgpuRenderer {
         }
 
         core.resources.queue.present(frame);
+        static FIRST_FRAME: std::sync::Once = std::sync::Once::new();
+        FIRST_FRAME.call_once(|| crate::startup_phase("first-frame"));
         true
     }
 }
