@@ -1673,6 +1673,7 @@ impl Window {
             tabbing_identifier,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             use_display_p3,
+            foreign_parent,
         } = options;
 
         let initial_window_title = titlebar
@@ -1700,6 +1701,7 @@ impl Window {
                 tabbing_identifier,
                 #[cfg(target_os = "macos")]
                 use_display_p3,
+                foreign_parent,
             },
         )?;
 
