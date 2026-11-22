@@ -2907,6 +2907,16 @@ pub enum WindowKind {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     LayerShell(layer_shell::LayerShellOptions),
 
+    /// A Wayland session lock surface (ext-session-lock-v1) on the window's display.
+    /// The first one locks the session; closing the last one unlocks it.
+    ///
+    /// Not ready for a real lock screen: closing the last lock window unlocks, so
+    /// losing the only display could unlock the session, and the app is not told
+    /// whether the compositor confirmed or refused the lock. A lock needs an
+    /// explicit unlock call and those two events first.
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    SessionLock,
+
     /// A window that appears on top of its parent window and blocks interaction with it
     /// until the modal window is closed
     Dialog,

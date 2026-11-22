@@ -44,6 +44,9 @@ use wayland_client::{
 use wayland_protocols::ext::background_effect::v1::client::{
     ext_background_effect_manager_v1, ext_background_effect_surface_v1,
 };
+use wayland_protocols::ext::session_lock::v1::client::{
+    ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -258,6 +261,8 @@ pub struct Globals {
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
     pub layer_shell: Option<zwlr_layer_shell_v1::ZwlrLayerShellV1>,
+    pub session_lock_manager: Option<ext_session_lock_manager_v1::ExtSessionLockManagerV1>,
+    pub session_lock: Rc<RefCell<SessionLockState>>,
     pub kde_blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub background_effects_manager:
         Option<ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1>,
@@ -311,6 +316,8 @@ impl Globals {
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
+            session_lock_manager: globals.bind(&qh, 1..=1, ()).ok(),
+            session_lock: Rc::default(),
             kde_blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             background_effects_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
@@ -1693,6 +1700,97 @@ delegate_noop!(WaylandClientStatePtr: ignore wl_region::WlRegion);
 delegate_noop!(WaylandClientStatePtr: ignore wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
+
+/// The one session lock all lock surfaces share.
+#[derive(Default)]
+pub struct SessionLockState {
+    pub lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
+    pub locked: bool,
+    pub surfaces: usize,
+}
+
+impl SessionLockState {
+    /// A lock surface is gone; the last one unlocks the session.
+    ///
+    /// Unsafe for a real lock screen: a lock that closes its windows as displays
+    /// go away unlocks the session when the last display is unplugged. Replace
+    /// this with an explicit unlock call before shipping a lock on it.
+    pub fn surface_destroyed(&mut self) {
+        self.surfaces = self.surfaces.saturating_sub(1);
+        if self.surfaces == 0
+            && let Some(lock) = self.lock.take()
+        {
+            let backend = lock.backend().upgrade();
+            if self.locked {
+                lock.unlock_and_destroy();
+            } else {
+                lock.destroy();
+            }
+            self.locked = false;
+            // The app often quits right after its last lock surface closes; send
+            // the unlock now, or the compositor sees a dead client and stays locked.
+            if let Some(backend) = backend
+                && let Err(error) = backend.flush()
+            {
+                log::error!("flushing the session unlock: {error}");
+            }
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &ext_session_lock_v1::ExtSessionLockV1,
+        event: ext_session_lock_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let state = client.borrow();
+        let mut lock = state.globals.session_lock.borrow_mut();
+        match event {
+            // The app only finds out from the log. A real lock screen has to be
+            // told about both events, to know when it is safe to sleep and when
+            // the lock was refused.
+            ext_session_lock_v1::Event::Locked => {
+                log::info!("session locked");
+                lock.locked = true;
+            }
+            ext_session_lock_v1::Event::Finished => {
+                log::warn!("the compositor refused or ended the session lock");
+                if let Some(lock) = lock.lock.take() {
+                    lock.destroy();
+                }
+                lock.locked = false;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ext_session_lock_surface_v1::ExtSessionLockSurfaceV1, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        this: &mut Self,
+        _: &ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+        event: ext_session_lock_surface_v1::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, surface_id) else {
+            return;
+        };
+        drop(state);
+        window.handle_lock_surface_event(event);
+    }
+}
 delegate_noop!(WaylandClientStatePtr: ignore xdg_positioner::XdgPositioner);
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur_manager::OrgKdeKwinBlurManager);
 delegate_noop!(WaylandClientStatePtr: ignore ext_background_effect_manager_v1::ExtBackgroundEffectManagerV1);
