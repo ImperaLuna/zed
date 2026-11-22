@@ -1260,12 +1260,18 @@ impl WaylandWindowStatePtr {
             .map(|v| f32::from(v) as i32)
             .map_size(|v| if v <= 0 { 1 } else { v });
 
-            state.surface_state.set_geometry(
-                window_geometry.origin.x,
-                window_geometry.origin.y,
-                window_geometry.size.width,
-                window_geometry.size.height,
-            );
+            // A layer surface has no window geometry, and for it this would
+            // ask for the very size the compositor just sent: a configure
+            // still on its way from before a `resize` then undoes that
+            // resize, and the two sizes can chase each other for good.
+            if !matches!(state.surface_state, WaylandSurfaceState::LayerShell(_)) {
+                state.surface_state.set_geometry(
+                    window_geometry.origin.x,
+                    window_geometry.origin.y,
+                    window_geometry.size.width,
+                    window_geometry.size.height,
+                );
+            }
 
             let initial_configure = self.frame_loop.get() == FrameLoop::Unconfigured;
             update_window(state);
