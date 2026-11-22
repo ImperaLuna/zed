@@ -2731,6 +2731,26 @@ impl Window {
         self.platform_window.set_exclusive_edge(edge);
     }
 
+    /// Change how keyboard events reach a layer-shell surface after it was
+    /// created: a shell's panel takes the keyboard only while it is open.
+    /// (Wayland layer-shell windows only)
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_keyboard_interactivity(
+        &self,
+        interactivity: crate::layer_shell::KeyboardInteractivity,
+    ) {
+        self.platform_window
+            .set_keyboard_interactivity(interactivity);
+    }
+
+    /// Move a layer-shell surface to another layer after it was created.
+    /// Ignored, with a warning, by a compositor whose layer-shell is older
+    /// than version 2. (Wayland layer-shell windows only)
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    pub fn set_layer(&self, layer: crate::layer_shell::Layer) {
+        self.platform_window.set_layer(layer);
+    }
+
     /// Start an interactive window resize operation if this window is resizable.
     pub fn start_window_resize(&self, edge: ResizeEdge) {
         if self.is_resizable {

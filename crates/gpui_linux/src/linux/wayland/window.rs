@@ -43,7 +43,7 @@ use gpui::{
     PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
     WindowKind, WindowParams, WindowVisibility,
-    layer_shell::{Anchor, LayerShellNotSupportedError},
+    layer_shell::{Anchor, KeyboardInteractivity, Layer, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
 };
@@ -523,6 +523,36 @@ impl WaylandSurfaceState {
             self
         {
             layer_surface.set_exclusive_zone(zone);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) -> bool {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
+            self
+        {
+            layer_surface.set_keyboard_interactivity(
+                super::layer_shell::wayland_keyboard_interactivity(interactivity),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `set_layer` came with version 2 of the protocol; sending it to an
+    /// older compositor is a protocol error. Returns whether it applied.
+    fn set_layer(&self, layer: Layer) -> bool {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
+            self
+        {
+            if layer_surface.version() < zwlr_layer_surface_v1::REQ_SET_LAYER_SINCE {
+                log::warn!("ignoring layer {layer:?}: the compositor's layer-shell is too old");
+                return false;
+            }
+            layer_surface.set_layer(super::layer_shell::wayland_layer(layer));
             true
         } else {
             false
@@ -2241,6 +2271,28 @@ impl PlatformWindow for WaylandWindow {
     fn set_exclusive_edge(&self, edge: Anchor) {
         let state = self.borrow();
         if state.surface_state.set_exclusive_edge(edge) {
+            // Commit to apply it immediately, otherwise it only takes effect
+            // on the next frame.
+            state.surface.commit();
+        }
+    }
+
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) {
+        let state = self.borrow();
+        if state
+            .surface_state
+            .set_keyboard_interactivity(interactivity)
+        {
+            // Commit to apply it immediately, otherwise it only takes effect
+            // on the next frame, and a window that isn't drawing never gets
+            // the keyboard.
+            state.surface.commit();
+        }
+    }
+
+    fn set_layer(&self, layer: Layer) {
+        let state = self.borrow();
+        if state.surface_state.set_layer(layer) {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
             state.surface.commit();

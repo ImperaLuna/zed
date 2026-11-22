@@ -673,6 +673,12 @@ pub trait PlatformDisplay: Debug {
     /// Get the bounds for this display
     fn bounds(&self) -> Bounds<Pixels>;
 
+    /// The name the system gives this display, like `DP-1` for a Wayland
+    /// output. `None` where the platform doesn't report one.
+    fn name(&self) -> Option<String> {
+        None
+    }
+
     /// The time between the display's refreshes. Variable refresh rate
     /// displays report their maximum rate. `None` when the platform doesn't
     /// report it.
@@ -1414,6 +1420,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_exclusive_zone(&self, _zone: Pixels) {}
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_keyboard_interactivity(&self, _interactivity: layer_shell::KeyboardInteractivity) {}
+    #[cfg(all(target_os = "linux", feature = "wayland"))]
+    fn set_layer(&self, _layer: layer_shell::Layer) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn set_blur_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn window_decorations(&self) -> Decorations {

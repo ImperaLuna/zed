@@ -42,6 +42,10 @@ impl PlatformDisplay for WaylandDisplay {
         self.bounds
     }
 
+    fn name(&self) -> Option<String> {
+        self.name.clone()
+    }
+
     fn refresh_interval(&self) -> Option<Duration> {
         self.refresh_interval
     }
