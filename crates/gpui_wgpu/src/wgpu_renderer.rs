@@ -198,6 +198,76 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    /// Custom shader surfaces (`Window::paint_shader`), built on first use.
+    custom_shaders: Option<CustomShaders>,
+}
+
+/// Most custom shader surfaces drawn in one frame; more are skipped.
+const MAX_CUSTOM_SHADER_QUADS: u64 = 32;
+/// Each surface's uniform block (bounds, clip, 56 params) sits at this stride.
+const CUSTOM_SHADER_STRIDE: u64 = 256;
+
+/// What every custom shader gets before its own `shade` function: the
+/// globals, its rectangle, its clip and its params, and the vertex and
+/// fragment entry points that call `shade`.
+const CUSTOM_SHADER_PRELUDE: &str = r#"
+struct GlobalParams {
+    viewport_size: vec2<f32>,
+    premultiplied_alpha: u32,
+    pad: u32,
+}
+@group(0) @binding(0) var<uniform> globals: GlobalParams;
+
+struct ShaderQuad {
+    bounds: vec4<f32>,
+    clip: vec4<f32>,
+    params: array<vec4<f32>, 14>,
+}
+@group(1) @binding(0) var<uniform> quad: ShaderQuad;
+
+struct ShaderVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) local: vec2<f32>,
+}
+
+@vertex
+fn vs_custom(@builtin(vertex_index) vertex_id: u32) -> ShaderVarying {
+    let unit = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let p = quad.bounds.xy + unit * quad.bounds.zw;
+    var out: ShaderVarying;
+    out.position = vec4<f32>(p / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
+    out.local = unit * quad.bounds.zw;
+    return out;
+}
+
+@fragment
+fn fs_custom(input: ShaderVarying) -> @location(0) vec4<f32> {
+    // Shade first: `shade` may take derivatives, which need uniform control flow.
+    let color = shade(input.local, quad.bounds.zw);
+    let p = input.position.xy;
+    if (p.x < quad.clip.x || p.y < quad.clip.y || p.x > quad.clip.x + quad.clip.z || p.y > quad.clip.y + quad.clip.w) {
+        discard;
+    }
+    if (globals.premultiplied_alpha != 0u) {
+        return color;
+    }
+    return vec4<f32>(color.rgb / max(color.a, 1e-5), color.a);
+}
+"#;
+
+struct CustomShaders {
+    layout: wgpu::BindGroupLayout,
+    buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    pipelines: FxHashMap<CustomShaderKey, wgpu::RenderPipeline>,
+}
+
+/// The address and length of a shader's source: sources are `'static`, so
+/// two with the same key are the same text and it is never hashed per frame.
+type CustomShaderKey = (usize, usize);
+
+fn custom_shader_key(shader: &gpui::ShaderPaint) -> CustomShaderKey {
+    (shader.source.as_ptr() as usize, shader.source.len())
 }
 
 struct CachedTextureBindGroup {
@@ -1090,6 +1160,7 @@ impl WgpuRenderer {
         };
         core.alpha_mode = new_alpha_mode;
         core.resources.pipelines = None;
+        core.resources.custom_shaders = None;
 
         if let RendererState::Ready { surface, core } = &self.state {
             surface.configure(&core.resources.device, &self.surface_config);
@@ -1343,6 +1414,7 @@ impl WgpuRendererCore {
                 device,
                 queue,
                 pipelines: None,
+                custom_shaders: None,
                 bind_group_layouts,
                 atlas_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
@@ -1518,6 +1590,7 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        self.prepare_custom_shaders(scene);
 
         let mut encoder =
             self.resources()
@@ -1632,7 +1705,9 @@ impl WgpuRendererCore {
                     }
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(surfaces) => {
+                        self.draw_custom_shaders(scene, surfaces, &mut pass)
+                    }
                 }
             }
         }
@@ -1750,6 +1825,169 @@ impl WgpuRendererCore {
                     bind_group,
                 },
             );
+        }
+    }
+
+    fn prepare_custom_shaders(&mut self, scene: &Scene) {
+        if !scene
+            .surfaces
+            .iter()
+            .any(|surface| surface.shader.is_some())
+        {
+            return;
+        }
+        let target_format = self.target_format;
+        let blend = match self.alpha_mode {
+            wgpu::CompositeAlphaMode::PreMultiplied => {
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+            }
+            _ => wgpu::BlendState::ALPHA_BLENDING,
+        };
+        let resources = &mut self.resources;
+        let device = resources.device.clone();
+        let custom = resources.custom_shaders.get_or_insert_with(|| {
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("custom_shader_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: true,
+                        min_binding_size: NonZeroU64::new(CUSTOM_SHADER_STRIDE),
+                    },
+                    count: None,
+                }],
+            });
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("custom_shader_uniforms"),
+                size: CUSTOM_SHADER_STRIDE * MAX_CUSTOM_SHADER_QUADS,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("custom_shader_bind_group"),
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &buffer,
+                        offset: 0,
+                        size: NonZeroU64::new(CUSTOM_SHADER_STRIDE),
+                    }),
+                }],
+            });
+            CustomShaders {
+                layout,
+                buffer,
+                bind_group,
+                pipelines: FxHashMap::default(),
+            }
+        });
+        for (index, surface) in scene.surfaces.iter().enumerate() {
+            let Some(shader) = &surface.shader else {
+                continue;
+            };
+            if index as u64 >= MAX_CUSTOM_SHADER_QUADS {
+                warn!("more than {MAX_CUSTOM_SHADER_QUADS} custom shader surfaces in a frame");
+                break;
+            }
+            let key = custom_shader_key(shader);
+            if !custom.pipelines.contains_key(&key) {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("custom_shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        format!("{CUSTOM_SHADER_PRELUDE}\n{}", shader.source).into(),
+                    ),
+                });
+                let pipeline_layout =
+                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                        label: Some("custom_shader_pipeline_layout"),
+                        bind_group_layouts: &[
+                            Some(&resources.bind_group_layouts.globals),
+                            Some(&custom.layout),
+                        ],
+                        immediate_size: 0,
+                    });
+                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("custom_shader"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some("vs_custom"),
+                        buffers: &[],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_custom"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target_format,
+                            blend: Some(blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleStrip,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                });
+                custom.pipelines.insert(key, pipeline);
+            }
+            let b = surface.bounds;
+            let c = surface.content_mask.bounds;
+            let mut block = [0f32; (CUSTOM_SHADER_STRIDE / 4) as usize];
+            block[..8].copy_from_slice(&[
+                b.origin.x.0,
+                b.origin.y.0,
+                b.size.width.0,
+                b.size.height.0,
+                c.origin.x.0,
+                c.origin.y.0,
+                c.size.width.0,
+                c.size.height.0,
+            ]);
+            block[8..8 + gpui::SHADER_PARAMS].copy_from_slice(&shader.params);
+            resources.queue.write_buffer(
+                &custom.buffer,
+                index as u64 * CUSTOM_SHADER_STRIDE,
+                bytemuck::cast_slice(&block),
+            );
+        }
+    }
+
+    fn draw_custom_shaders(
+        &self,
+        scene: &Scene,
+        range: Range<usize>,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        let Some(custom) = &self.resources().custom_shaders else {
+            return;
+        };
+        for index in range {
+            let Some(shader) = &scene.surfaces[index].shader else {
+                continue;
+            };
+            if index as u64 >= MAX_CUSTOM_SHADER_QUADS {
+                return;
+            }
+            let Some(pipeline) = custom.pipelines.get(&custom_shader_key(shader)) else {
+                continue;
+            };
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+            pass.set_bind_group(
+                1,
+                &custom.bind_group,
+                &[(index as u64 * CUSTOM_SHADER_STRIDE) as u32],
+            );
+            pass.draw(0..4, 0..1);
         }
     }
 

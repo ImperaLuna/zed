@@ -771,6 +771,23 @@ pub struct PaintSurface {
     pub content_mask: ContentMask<ScaledPixels>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub image_buffer: objc2_core_foundation::CFRetained<objc2_core_video::CVPixelBuffer>,
+    /// A custom fragment shader that draws this surface (wgpu renderer only).
+    pub shader: Option<ShaderPaint>,
+}
+
+/// How many floats a custom shader receives (`params` in WGSL, as 14 vec4s).
+pub const SHADER_PARAMS: usize = 56;
+
+/// A custom WGSL fragment shader for one rectangle, see `Window::paint_shader`.
+#[derive(Clone, Debug)]
+pub struct ShaderPaint {
+    /// WGSL that defines `fn shade(p: vec2<f32>, size: vec2<f32>) -> vec4<f32>`,
+    /// returning premultiplied color for the device pixel `p` inside a
+    /// rectangle of `size` device pixels. It reads its numbers from
+    /// `quad.params[i]` (vec4s). One pipeline is built per distinct source.
+    pub source: &'static str,
+    /// The shader's numbers, read as `quad.params`.
+    pub params: [f32; SHADER_PARAMS],
 }
 
 impl From<PaintSurface> for Primitive {

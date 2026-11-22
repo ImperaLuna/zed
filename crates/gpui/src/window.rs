@@ -5434,6 +5434,28 @@ impl Window {
             bounds,
             content_mask,
             image_buffer,
+            shader: None,
+        });
+    }
+
+    /// Paints `bounds` with a custom WGSL fragment shader (see [`crate::ShaderPaint`]).
+    /// Only the wgpu renderer draws it. `params` reach the shader as
+    /// `quad.params`; sizes in them should be in device pixels.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn paint_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: &'static str,
+        params: [f32; crate::SHADER_PARAMS],
+    ) {
+        self.invalidator.debug_assert_paint();
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame.scene.insert_primitive(crate::PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            shader: Some(crate::ShaderPaint { source, params }),
         });
     }
 
