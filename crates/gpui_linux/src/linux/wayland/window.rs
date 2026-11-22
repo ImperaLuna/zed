@@ -113,6 +113,8 @@ pub struct WaylandWindowState {
     appearance: WindowAppearance,
     kde_blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     background_effects: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    /// The blurred area, when the app limits it; None blurs the whole window.
+    blur_rects: Option<Vec<Bounds<i32>>>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -674,6 +676,7 @@ impl WaylandWindowState {
             app_id: options.app_id,
             kde_blur: None,
             background_effects: None,
+            blur_rects: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -1998,6 +2001,22 @@ impl PlatformWindow for WaylandWindow {
         state.app_id = Some(app_id.to_owned());
     }
 
+    fn set_blur_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        let mut state = self.borrow_mut();
+        let rects = region.map(|rects| {
+            rects
+                .iter()
+                .map(|rect| rect.map(|pixels| f32::from(pixels) as i32))
+                .collect::<Vec<_>>()
+        });
+        if state.blur_rects == rects {
+            return;
+        }
+        state.blur_rects = rects;
+        // Double-buffered state: it applies with the next frame's commit.
+        update_window(state);
+    }
+
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut state = self.borrow_mut();
         if state.background_appearance == background_appearance {
@@ -2576,9 +2595,23 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 state.background_effects = Some(background_effects);
             }
 
-            add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
-                region.add(x, y, width, height);
-            });
+            match &state.blur_rects {
+                Some(rects) => {
+                    for rect in rects {
+                        region.add(
+                            rect.origin.x,
+                            rect.origin.y,
+                            rect.size.width,
+                            rect.size.height,
+                        );
+                    }
+                }
+                None => {
+                    add_rounded_rect(area, state.client_corner_radii, |x, y, width, height| {
+                        region.add(x, y, width, height);
+                    });
+                }
+            }
 
             state
                 .background_effects

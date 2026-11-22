@@ -2748,6 +2748,13 @@ impl Window {
         self.platform_window.set_input_region(region);
     }
 
+    /// Linux (wayland) only: Limit the background blur of a `Blurred` window to the union of
+    /// `rects`, in window coordinates. `None` blurs the whole window again. Applies on the next
+    /// frame.
+    pub fn set_blur_region(&self, region: Option<&[Bounds<Pixels>]>) {
+        self.platform_window.set_blur_region(region);
+    }
+
     /// Return the `WindowBounds` to indicate that how a window should be opened
     /// after it has been closed
     pub fn window_bounds(&self) -> WindowBounds {
