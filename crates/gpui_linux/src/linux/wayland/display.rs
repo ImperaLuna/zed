@@ -8,7 +8,9 @@ use anyhow::Context as _;
 use uuid::Uuid;
 use wayland_backend::client::ObjectId;
 
-use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, refresh_interval_from_hz};
+use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay, px, refresh_interval_from_hz};
+
+use super::client::Output;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WaylandDisplay {
@@ -17,6 +19,17 @@ pub(crate) struct WaylandDisplay {
     pub name: Option<String>,
     pub bounds: Bounds<Pixels>,
     pub refresh_interval: Option<Duration>,
+}
+
+impl WaylandDisplay {
+    pub(crate) fn new(id: ObjectId, output: &Output) -> Self {
+        Self {
+            id,
+            name: output.name.clone(),
+            bounds: output.logical_bounds.map(|value| px(value as f32)),
+            refresh_interval: output.refresh_interval,
+        }
+    }
 }
 
 impl Hash for WaylandDisplay {

@@ -1990,12 +1990,7 @@ impl PlatformWindow for WaylandWindow {
             .display
             .clone()
             .or_else(|| state.client.sole_output())?;
-        Some(Rc::new(WaylandDisplay {
-            id,
-            name: display.name.clone(),
-            bounds: display.bounds.to_pixels(state.scale),
-            refresh_interval: display.refresh_interval,
-        }))
+        Some(Rc::new(WaylandDisplay::new(id, &display)))
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
