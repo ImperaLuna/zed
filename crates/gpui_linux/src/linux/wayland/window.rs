@@ -2687,8 +2687,11 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     // replaces the deprecated kde-blur protocol, which is no longer supported
     // since KDE Plasma 6.7.
     // https://invent.kde.org/plasma/kwin/-/commit/7f9e0aa1cd2c2ab4fea1097800893b6f780089eb
+    // An empty blur region goes as no effect at all: live Hyprland was seen
+    // blurring a whole layer surface whose region had become empty.
+    let blurs_nothing = state.blur_rects.as_ref().is_some_and(|rects| rects.is_empty());
     if let Some(ref background_effects_manager) = state.globals.background_effects_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
+        if state.background_appearance == WindowBackgroundAppearance::Blurred && !blurs_nothing {
             if state.background_effects.is_none() {
                 log::debug!("Using ext-background-effect protocol");
                 let background_effects = background_effects_manager.get_background_effect(
