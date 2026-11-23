@@ -47,6 +47,9 @@ use wayland_protocols::ext::background_effect::v1::client::{
 use wayland_protocols::ext::session_lock::v1::client::{
     ext_session_lock_manager_v1, ext_session_lock_surface_v1, ext_session_lock_v1,
 };
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -81,9 +84,6 @@ use wayland_protocols::{
 use wayland_protocols::{
     wp::fractional_scale::v1::client::{wp_fractional_scale_manager_v1, wp_fractional_scale_v1},
     xdg::dialog::v1::client::xdg_dialog_v1::XdgDialogV1,
-};
-use wayland_protocols::wp::idle_inhibit::zv1::client::{
-    zwp_idle_inhibit_manager_v1, zwp_idle_inhibitor_v1,
 };
 use wayland_protocols_plasma::blur::client::{org_kde_kwin_blur, org_kde_kwin_blur_manager};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
@@ -705,6 +705,34 @@ impl WaylandClientStatePtr {
         ) {
             log::error!("Failed to schedule frame retry: {err}");
         }
+    }
+
+    /// Whether the timer is set: not while the client is being updated.
+    pub fn schedule_frame_fallback(&self, surface_id: &ObjectId, delay: Duration) -> bool {
+        let client = self.get_client();
+        let Ok(state) = client.try_borrow() else {
+            return false;
+        };
+        let surface_id = surface_id.clone();
+        let this = self.clone();
+        if let Err(err) =
+            state
+                .loop_handle
+                .insert_source(Timer::from_duration(delay), move |_, _, _| {
+                    let Some(client) = this.0.upgrade() else {
+                        return TimeoutAction::Drop;
+                    };
+                    let window = get_window(&mut client.borrow_mut(), &surface_id);
+                    if let Some(window) = window {
+                        window.fallback_timer_fired();
+                    }
+                    TimeoutAction::Drop
+                })
+        {
+            log::error!("Failed to schedule frame fallback: {err}");
+            return false;
+        }
+        true
     }
 
     pub fn get_serial(&self, kind: SerialKind) -> Serial {

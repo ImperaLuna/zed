@@ -4,7 +4,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use calloop::ping::Ping;
@@ -649,7 +649,20 @@ pub struct WaylandWindowStatePtr {
     frame_loop: Rc<Cell<FrameLoop>>,
     frame_ping: Ping,
     scheduled_frame_at: Rc<Cell<Option<Instant>>>,
+    /// A frame is wanted and a timer will draw it if the compositor's
+    /// callback doesn't come first.
+    fallback_armed: Rc<Cell<bool>>,
+    fallback_delay: Rc<Cell<Duration>>,
 }
+
+/// How long a wanted frame waits for the compositor's callback before it is
+/// drawn anyway. A layer surface raised to the overlay layer over a window
+/// going fullscreen got none from Hyprland until its exclusive zone changed:
+/// a slide meant to take 250 ms stood still on its first frame meanwhile.
+const FRAME_FALLBACK_DELAY: Duration = Duration::from_millis(50);
+/// A surface the compositor really hides gets no callbacks at all: each
+/// fallback in a row waits twice as long, up to this.
+const FRAME_FALLBACK_MAX_DELAY: Duration = Duration::from_secs(1);
 
 impl WaylandWindowState {
     pub(crate) fn new(
@@ -996,6 +1009,8 @@ impl WaylandWindow {
             frame_loop: Rc::new(Cell::new(FrameLoop::Unconfigured)),
             frame_ping,
             scheduled_frame_at: Rc::new(Cell::new(None)),
+            fallback_armed: Rc::new(Cell::new(false)),
+            fallback_delay: Rc::new(Cell::new(FRAME_FALLBACK_DELAY)),
         });
 
         // Kick things off. A lock surface is configured without it, and
@@ -1147,6 +1162,7 @@ impl WaylandWindowStatePtr {
         // Another wl_surface commit may have carried this callback while a retry
         // timer owned the render-loop wakeup.
         self.state.borrow_mut().pending_frame_callback = None;
+        self.fallback_delay.set(FRAME_FALLBACK_DELAY);
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
@@ -1170,6 +1186,34 @@ impl WaylandWindowStatePtr {
         }
     }
 
+    pub fn fallback_timer_fired(&self) {
+        self.fallback_armed.set(false);
+        if self.frame_loop.get() == FrameLoop::AwaitingCallback {
+            let delay = self.fallback_delay.get();
+            log::debug!("no frame callback within {delay:?}, drawing anyway");
+            self.fallback_delay
+                .set((delay * 2).min(FRAME_FALLBACK_MAX_DELAY));
+            self.frame(
+                PlatformFrameSignal::capture(Instant::now),
+                FrameRequestSource::LocalSchedule,
+            );
+        }
+    }
+
+    fn arm_fallback(&self) {
+        if self.fallback_armed.get() {
+            return;
+        }
+        let Ok(state) = self.state.try_borrow() else {
+            return;
+        };
+        let surface_id = state.surface.id();
+        let client = state.client.clone();
+        drop(state);
+        let armed = client.schedule_frame_fallback(&surface_id, self.fallback_delay.get());
+        self.fallback_armed.set(armed);
+    }
+
     pub fn is_configured(&self) -> bool {
         self.frame_loop.get() != FrameLoop::Unconfigured
     }
@@ -1185,8 +1229,10 @@ impl WaylandWindowStatePtr {
             FrameLoop::Ticking => {
                 self.frame_loop.set(FrameLoop::RescheduleRequested);
             }
-            // A wake is already armed: a ping or retry timer is in flight, or a
-            // presented buffer guarantees a compositor frame callback.
+            // A presented buffer should bring a compositor frame callback,
+            // but one can be withheld.
+            FrameLoop::AwaitingCallback => self.arm_fallback(),
+            // A wake is already armed: a ping or retry timer is in flight.
             _ => {}
         }
     }
@@ -2087,8 +2133,7 @@ impl PlatformWindow for WaylandWindow {
                     log::warn!("The compositor has no idle-inhibit protocol: it may still go idle");
                     return;
                 };
-                let inhibitor =
-                    manager.create_inhibitor(&state.surface, &state.globals.qh, ());
+                let inhibitor = manager.create_inhibitor(&state.surface, &state.globals.qh, ());
                 state.idle_inhibitor = Some(inhibitor);
             }
             (false, Some(inhibitor)) => inhibitor.destroy(),
@@ -2720,7 +2765,10 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     // https://invent.kde.org/plasma/kwin/-/commit/7f9e0aa1cd2c2ab4fea1097800893b6f780089eb
     // An empty blur region goes as no effect at all: live Hyprland was seen
     // blurring a whole layer surface whose region had become empty.
-    let blurs_nothing = state.blur_rects.as_ref().is_some_and(|rects| rects.is_empty());
+    let blurs_nothing = state
+        .blur_rects
+        .as_ref()
+        .is_some_and(|rects| rects.is_empty());
     if let Some(ref background_effects_manager) = state.globals.background_effects_manager {
         if state.background_appearance == WindowBackgroundAppearance::Blurred && !blurs_nothing {
             if state.background_effects.is_none() {
