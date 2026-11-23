@@ -119,6 +119,10 @@ pub struct WaylandWindowState {
     /// The blurred area, when the app limits it; None blurs the whole window.
     blur_rects: Option<Vec<Bounds<i32>>>,
     viewport: Option<wp_viewport::WpViewport>,
+    /// The viewport's size for the next drawn frame. It goes out with that
+    /// frame's buffer: a commit in between (input region, layer) would
+    /// otherwise stretch the old buffer to the new size for a frame.
+    viewport_destination: Option<Size<i32>>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
     globals: Globals,
@@ -705,6 +709,7 @@ impl WaylandWindowState {
             background_effects: None,
             blur_rects: None,
             viewport,
+            viewport_destination: None,
             globals,
             outputs: HashMap::default(),
             display: None,
@@ -1666,9 +1671,9 @@ impl WaylandWindowStatePtr {
             self.callbacks.borrow_mut().resize = Some(fun);
         }
 
-        let state = self.state.borrow_mut();
-        if let Some(viewport) = &state.viewport {
-            viewport.set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+        let mut state = self.state.borrow_mut();
+        if state.viewport.is_some() {
+            state.viewport_destination = Some(size.map(|value| f32::from(value) as i32));
         }
         update_window(state);
     }
@@ -2209,6 +2214,13 @@ impl PlatformWindow for WaylandWindow {
         if state.pending_frame_callback.is_none() {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
+        }
+        if let Some((viewport, size)) = state
+            .viewport
+            .as_ref()
+            .zip(state.viewport_destination.take())
+        {
+            viewport.set_destination(size.width, size.height);
         }
         if renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
