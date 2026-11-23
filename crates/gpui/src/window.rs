@@ -5491,6 +5491,45 @@ impl Window {
         source: &'static str,
         params: [f32; crate::SHADER_PARAMS],
     ) {
+        self.insert_shader(bounds, source, params, None);
+    }
+
+    /// Paints `bounds` with a custom WGSL fragment shader that can read
+    /// `data`'s first frame: `image(uv)` in the shader returns its color
+    /// (alpha not premultiplied) at `uv`, 0 to 1 across the picture. The
+    /// picture goes into the sprite atlas as `paint_image` puts it, and
+    /// leaves it with `drop_image`.
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub fn paint_shader_image(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: &'static str,
+        params: [f32; crate::SHADER_PARAMS],
+        data: &RenderImage,
+    ) -> Result<()> {
+        let key = RenderImageParams {
+            image_id: data.id,
+            frame_index: 0,
+        };
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(key.into(), &mut || {
+                let bytes = data.as_bytes(0).context("a picture without frames")?;
+                Ok(Some((data.size(0), Cow::Borrowed(bytes))))
+            })?
+            .context("a picture without a place in the atlas")?;
+        self.insert_shader(bounds, source, params, Some(tile));
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    fn insert_shader(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        source: &'static str,
+        params: [f32; crate::SHADER_PARAMS],
+        image: Option<AtlasTile>,
+    ) {
         self.invalidator.debug_assert_paint();
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
@@ -5498,7 +5537,11 @@ impl Window {
             order: 0,
             bounds,
             content_mask,
-            shader: Some(crate::ShaderPaint { source, params }),
+            shader: Some(crate::ShaderPaint {
+                source,
+                params,
+                image,
+            }),
         });
     }
 

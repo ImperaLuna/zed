@@ -204,8 +204,11 @@ struct WgpuResources {
 
 /// Most custom shader surfaces drawn in one frame; more are skipped.
 const MAX_CUSTOM_SHADER_QUADS: u64 = 32;
-/// Each surface's uniform block (bounds, clip, 56 params) sits at this stride.
-const CUSTOM_SHADER_STRIDE: u64 = 256;
+/// Each surface's uniform block sits at this stride.
+const CUSTOM_SHADER_STRIDE: u64 = 512;
+/// The block's own size: bounds, clip, 56 params and the picture's place
+/// in its atlas texture, as 17 vec4s.
+const CUSTOM_SHADER_BLOCK: u64 = 272;
 
 /// What every custom shader gets before its own `shade` function: the
 /// globals, its rectangle, its clip and its params, and the vertex and
@@ -222,6 +225,7 @@ struct ShaderQuad {
     bounds: vec4<f32>,
     clip: vec4<f32>,
     params: array<vec4<f32>, 14>,
+    image: vec4<f32>,
 }
 @group(1) @binding(0) var<uniform> quad: ShaderQuad;
 
@@ -255,6 +259,23 @@ fn fs_custom(input: ShaderVarying) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Added for a shader painted with a picture (`Window::paint_shader_image`):
+/// the atlas texture the picture is in, and `image` to read it.
+const CUSTOM_SHADER_IMAGE: &str = r#"
+@group(2) @binding(0) var t_image: texture_2d<f32>;
+@group(2) @binding(1) var s_image: sampler;
+
+// The picture's color at `uv` (0 to 1 across it), alpha not premultiplied.
+// Kept half a texel inside the picture, so its neighbours in the atlas
+// never bleed in.
+fn image(uv: vec2<f32>) -> vec4<f32> {
+    let low = quad.image.xy + vec2<f32>(0.5);
+    let high = quad.image.xy + quad.image.zw - vec2<f32>(0.5);
+    let texel = clamp(quad.image.xy + uv * quad.image.zw, low, high);
+    return textureSampleLevel(t_image, s_image, texel / vec2<f32>(textureDimensions(t_image, 0)), 0.0);
+}
+"#;
+
 struct CustomShaders {
     layout: wgpu::BindGroupLayout,
     buffer: wgpu::Buffer,
@@ -262,12 +283,17 @@ struct CustomShaders {
     pipelines: FxHashMap<CustomShaderKey, wgpu::RenderPipeline>,
 }
 
-/// The address and length of a shader's source: sources are `'static`, so
-/// two with the same key are the same text and it is never hashed per frame.
-type CustomShaderKey = (usize, usize);
+/// The address and length of a shader's source, and whether it reads a
+/// picture: sources are `'static`, so two with the same key are the same
+/// text and it is never hashed per frame.
+type CustomShaderKey = (usize, usize, bool);
 
 fn custom_shader_key(shader: &gpui::ShaderPaint) -> CustomShaderKey {
-    (shader.source.as_ptr() as usize, shader.source.len())
+    (
+        shader.source.as_ptr() as usize,
+        shader.source.len(),
+        shader.image.is_some(),
+    )
 }
 
 struct CachedTextureBindGroup {
@@ -1795,6 +1821,15 @@ impl WgpuRendererCore {
                 texture_ids.push(texture_id);
             }
         }
+        // The pictures custom shaders read.
+        for surface in &scene.surfaces {
+            let image = surface.shader.as_ref().and_then(|shader| shader.image);
+            if let Some(tile) = image
+                && !texture_ids.contains(&tile.texture_id)
+            {
+                texture_ids.push(tile.texture_id);
+            }
+        }
 
         self.resources_mut()
             .atlas_texture_bind_groups
@@ -1854,7 +1889,7 @@ impl WgpuRendererCore {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: true,
-                        min_binding_size: NonZeroU64::new(CUSTOM_SHADER_STRIDE),
+                        min_binding_size: NonZeroU64::new(CUSTOM_SHADER_BLOCK),
                     },
                     count: None,
                 }],
@@ -1873,7 +1908,7 @@ impl WgpuRendererCore {
                     resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                         buffer: &buffer,
                         offset: 0,
-                        size: NonZeroU64::new(CUSTOM_SHADER_STRIDE),
+                        size: NonZeroU64::new(CUSTOM_SHADER_BLOCK),
                     }),
                 }],
             });
@@ -1894,10 +1929,21 @@ impl WgpuRendererCore {
             }
             let key = custom_shader_key(shader);
             if !custom.pipelines.contains_key(&key) {
+                let (image_prelude, image_layout) = match shader.image {
+                    Some(_) => (
+                        CUSTOM_SHADER_IMAGE,
+                        Some(&resources.bind_group_layouts.texture),
+                    ),
+                    None => ("", None),
+                };
                 let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                     label: Some("custom_shader"),
                     source: wgpu::ShaderSource::Wgsl(
-                        format!("{CUSTOM_SHADER_PRELUDE}\n{}", shader.source).into(),
+                        format!(
+                            "{CUSTOM_SHADER_PRELUDE}\n{image_prelude}\n{}",
+                            shader.source
+                        )
+                        .into(),
                     ),
                 });
                 let pipeline_layout =
@@ -1906,6 +1952,7 @@ impl WgpuRendererCore {
                         bind_group_layouts: &[
                             Some(&resources.bind_group_layouts.globals),
                             Some(&custom.layout),
+                            image_layout,
                         ],
                         immediate_size: 0,
                     });
@@ -1953,6 +2000,15 @@ impl WgpuRendererCore {
                 c.size.height.0,
             ]);
             block[8..8 + gpui::SHADER_PARAMS].copy_from_slice(&shader.params);
+            if let Some(tile) = &shader.image {
+                let (origin, size) = (tile.bounds.origin, tile.bounds.size);
+                block[8 + gpui::SHADER_PARAMS..12 + gpui::SHADER_PARAMS].copy_from_slice(&[
+                    origin.x.0 as f32,
+                    origin.y.0 as f32,
+                    size.width.0 as f32,
+                    size.height.0 as f32,
+                ]);
+            }
             resources.queue.write_buffer(
                 &custom.buffer,
                 index as u64 * CUSTOM_SHADER_STRIDE,
@@ -1980,8 +2036,24 @@ impl WgpuRendererCore {
             let Some(pipeline) = custom.pipelines.get(&custom_shader_key(shader)) else {
                 continue;
             };
+            // The atlas let the picture's texture go: a stale paint, as for
+            // sprites.
+            let texture = match &shader.image {
+                Some(tile) => match self
+                    .resources()
+                    .atlas_texture_bind_groups
+                    .get(&tile.texture_id)
+                {
+                    Some(texture) => Some(&texture.bind_group),
+                    None => continue,
+                },
+                None => None,
+            };
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &self.resources().globals_bind_group, &[]);
+            if let Some(texture) = texture {
+                pass.set_bind_group(2, texture, &[]);
+            }
             pass.set_bind_group(
                 1,
                 &custom.bind_group,

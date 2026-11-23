@@ -788,6 +788,9 @@ pub struct ShaderPaint {
     pub source: &'static str,
     /// The shader's numbers, read as `quad.params`.
     pub params: [f32; SHADER_PARAMS],
+    /// A picture the shader samples with `image(uv)`, see
+    /// `Window::paint_shader_image`.
+    pub image: Option<AtlasTile>,
 }
 
 impl From<PaintSurface> for Primitive {
