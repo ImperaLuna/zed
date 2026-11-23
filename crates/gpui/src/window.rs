@@ -1269,7 +1269,9 @@ pub struct Window {
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
-    /// True from after a `MouseExited` until the pointer is next heard from.
+    /// True from after a `MouseExited`, or from the start while the platform
+    /// doesn't say the window has the pointer, until the pointer is next
+    /// heard from.
     /// The last position stays inside the window, so a hit test from it
     /// would keep hovering whatever the pointer left over.
     mouse_outside: bool,
@@ -1718,6 +1720,11 @@ impl Window {
         let display_id = platform_window.display().map(|display| display.id());
         let sprite_atlas = platform_window.sprite_atlas();
         let mouse_position = platform_window.mouse_position();
+        // A new window has the pointer only once the platform says so: its
+        // position until then is wherever the pointer was, on any window, or
+        // the origin. Taken as over this one, the element at that spot
+        // counted as hovered until the pointer came and left.
+        let mouse_outside = !platform_window.is_hovered();
         let modifiers = platform_window.modifiers();
         let capslock = platform_window.capslock();
         let content_size = platform_window.content_size();
@@ -2404,7 +2411,7 @@ impl Window {
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
-            mouse_outside: false,
+            mouse_outside,
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
@@ -6019,6 +6026,10 @@ impl Window {
                     | PlatformInput::MouseUp(_)
                     | PlatformInput::Scroll(_)
                     | PlatformInput::Pinch(_)
+                    | PlatformInput::LongPress(_)
+                    | PlatformInput::TouchDrag(_)
+                    | PlatformInput::BackGesture(_)
+                    | PlatformInput::Touch(_)
                     | PlatformInput::FileDrop(
                         FileDropEvent::Entered { .. } | FileDropEvent::Pending { .. }
                     )
