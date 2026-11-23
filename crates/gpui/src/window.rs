@@ -1269,6 +1269,10 @@ pub struct Window {
     focus_lost_path: SmallVec<[FocusId; 8]>,
     default_prevented: bool,
     mouse_position: Point<Pixels>,
+    /// True from after a `MouseExited` until the pointer is next heard from.
+    /// The last position stays inside the window, so a hit test from it
+    /// would keep hovering whatever the pointer left over.
+    mouse_outside: bool,
     mouse_hit_test: HitTest,
     modifiers: Modifiers,
     capslock: Capslock,
@@ -2400,6 +2404,7 @@ impl Window {
             focus_lost_path: SmallVec::new(),
             default_prevented: true,
             mouse_position,
+            mouse_outside: false,
             mouse_hit_test: HitTest::default(),
             modifiers,
             capslock,
@@ -4013,7 +4018,11 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = if self.mouse_outside {
+            HitTest::default()
+        } else {
+            self.next_frame.hit_test(self.mouse_position)
+        };
 
         // Now actually paint the elements.
         #[cfg(feature = "profiler")]
@@ -5951,6 +5960,23 @@ impl Window {
         // Handlers may set this to true by calling `prevent_default`.
         self.default_prevented = false;
 
+        // The pointer is back (see `mouse_outside`).
+        if self.mouse_outside
+            && matches!(
+                &event,
+                PlatformInput::MouseMove(_)
+                    | PlatformInput::MouseDown(_)
+                    | PlatformInput::MouseUp(_)
+                    | PlatformInput::Scroll(_)
+                    | PlatformInput::Pinch(_)
+                    | PlatformInput::FileDrop(
+                        FileDropEvent::Entered { .. } | FileDropEvent::Pending { .. }
+                    )
+            )
+        {
+            self.mouse_outside = false;
+        }
+
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
@@ -6083,6 +6109,23 @@ impl Window {
                 }
                 crate::TouchPhase::Started | crate::TouchPhase::Moved => {}
             }
+        }
+
+        // On Linux nothing follows a pointer's leave until it comes back, so
+        // every later frame would hover the element it left over. Set only
+        // now: the exit's own listeners still test against where it was.
+        // Other platforms keep their own behavior.
+        if cfg!(any(target_os = "linux", target_os = "freebsd"))
+            && !self.mouse_outside
+            && matches!(
+                &event,
+                PlatformInput::MouseExited(_) | PlatformInput::FileDrop(FileDropEvent::Exited)
+            )
+        {
+            self.mouse_outside = true;
+            self.mouse_hit_test = HitTest::default();
+            // Hover styles repaint on mouse moves only.
+            self.refresh();
         }
 
         // Must run after the move is dispatched: the platform owns the gesture afterwards, so this
@@ -6276,7 +6319,11 @@ impl Window {
     }
 
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        self.mouse_hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        self.mouse_hit_test = if self.mouse_outside {
+            HitTest::default()
+        } else {
+            self.rendered_frame.hit_test(self.mouse_position())
+        };
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         if self.is_inspector_picking(cx) {

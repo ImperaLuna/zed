@@ -4809,6 +4809,28 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true, false, true, false]);
+
+        // The last position is still over the target: a later frame must not
+        // hover it again while the pointer is away.
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        {
+            cx.update_window(any_window, |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(*hover_transitions.borrow(), [true, false, true, false]);
+
+            cx.update_window(any_window, |_, window, cx| {
+                window.simulate_mouse_move(pointer_position, cx);
+            })
+            .unwrap();
+            assert_eq!(
+                *hover_transitions.borrow(),
+                [true, false, true, false, true]
+            );
+        }
     }
 
     #[gpui::test]
