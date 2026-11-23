@@ -1529,6 +1529,27 @@ impl WaylandConnection {
         None
     }
 
+    pub(crate) fn lock_session(&self) -> anyhow::Result<()> {
+        let state = self.0.borrow();
+        let Some(manager) = state.globals.session_lock_manager.as_ref() else {
+            anyhow::bail!("Compositor doesn't support ext_session_lock_manager_v1");
+        };
+        state
+            .globals
+            .session_lock
+            .borrow_mut()
+            .ensure(manager, &state.globals.qh);
+        Ok(())
+    }
+
+    pub(crate) fn unlock_session(&self) {
+        self.0.borrow().globals.session_lock.borrow_mut().release();
+    }
+
+    pub(crate) fn session_lock_state(&self) -> gpui::SessionLockState {
+        self.0.borrow().globals.session_lock.borrow().state()
+    }
+
     pub(crate) fn compositor_name(&self) -> &'static str {
         "Wayland"
     }
@@ -1702,39 +1723,56 @@ delegate_noop!(WaylandClientStatePtr: ignore zxdg_decoration_manager_v1::ZxdgDec
 delegate_noop!(WaylandClientStatePtr: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 delegate_noop!(WaylandClientStatePtr: ignore ext_session_lock_manager_v1::ExtSessionLockManagerV1);
 
-/// The one session lock all lock surfaces share.
+/// The one session lock all lock surfaces share. Only [`Self::release`]
+/// lets go of it: closing lock surfaces never does, so a lock screen may
+/// close its windows as displays go away and the session stays locked.
 #[derive(Default)]
 pub struct SessionLockState {
-    pub lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
-    pub locked: bool,
-    pub surfaces: usize,
+    lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
+    /// The compositor confirmed `lock`.
+    locked: bool,
 }
 
 impl SessionLockState {
-    /// A lock surface is gone; the last one unlocks the session.
-    ///
-    /// Unsafe for a real lock screen: a lock that closes its windows as displays
-    /// go away unlocks the session when the last display is unplugged. Replace
-    /// this with an explicit unlock call before shipping a lock on it.
-    pub fn surface_destroyed(&mut self) {
-        self.surfaces = self.surfaces.saturating_sub(1);
-        if self.surfaces == 0
-            && let Some(lock) = self.lock.take()
+    /// The lock, asked for now when there is none yet.
+    pub fn ensure(
+        &mut self,
+        manager: &ext_session_lock_manager_v1::ExtSessionLockManagerV1,
+        qh: &QueueHandle<WaylandClientStatePtr>,
+    ) -> ext_session_lock_v1::ExtSessionLockV1 {
+        self.lock
+            .get_or_insert_with(|| manager.lock(qh, ()))
+            .clone()
+    }
+
+    pub fn state(&self) -> gpui::SessionLockState {
+        match (&self.lock, self.locked) {
+            (None, _) => gpui::SessionLockState::Unlocked,
+            (Some(_), false) => gpui::SessionLockState::Pending,
+            (Some(_), true) => gpui::SessionLockState::Locked,
+        }
+    }
+
+    /// Lets go of the lock: unlocks when the compositor had confirmed it,
+    /// which is the only request the protocol allows then, and withdraws
+    /// it otherwise.
+    pub fn release(&mut self) {
+        let Some(lock) = self.lock.take() else {
+            return;
+        };
+        let backend = lock.backend().upgrade();
+        if self.locked {
+            lock.unlock_and_destroy();
+        } else {
+            lock.destroy();
+        }
+        self.locked = false;
+        // The app may quit right after unlocking; send the unlock now, or the
+        // compositor sees a dead client and stays locked.
+        if let Some(backend) = backend
+            && let Err(error) = backend.flush()
         {
-            let backend = lock.backend().upgrade();
-            if self.locked {
-                lock.unlock_and_destroy();
-            } else {
-                lock.destroy();
-            }
-            self.locked = false;
-            // The app often quits right after its last lock surface closes; send
-            // the unlock now, or the compositor sees a dead client and stays locked.
-            if let Some(backend) = backend
-                && let Err(error) = backend.flush()
-            {
-                log::error!("flushing the session unlock: {error}");
-            }
+            log::error!("flushing the session unlock: {error}");
         }
     }
 }
@@ -1742,31 +1780,42 @@ impl SessionLockState {
 impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStatePtr {
     fn event(
         this: &mut Self,
-        _: &ext_session_lock_v1::ExtSessionLockV1,
+        lock: &ext_session_lock_v1::ExtSessionLockV1,
         event: ext_session_lock_v1::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
-        let state = client.borrow();
-        let mut lock = state.globals.session_lock.borrow_mut();
-        match event {
-            // The app only finds out from the log. A real lock screen has to be
-            // told about both events, to know when it is safe to sleep and when
-            // the lock was refused.
-            ext_session_lock_v1::Event::Locked => {
-                log::info!("session locked");
-                lock.locked = true;
+        let common = {
+            let state = client.borrow();
+            let mut session_lock = state.globals.session_lock.borrow_mut();
+            // An answer for a lock the app has let go of since.
+            if session_lock.lock.as_ref() != Some(lock) {
+                return;
             }
-            ext_session_lock_v1::Event::Finished => {
-                log::warn!("the compositor refused or ended the session lock");
-                if let Some(lock) = lock.lock.take() {
-                    lock.destroy();
+            match event {
+                ext_session_lock_v1::Event::Locked => {
+                    log::info!("session locked");
+                    session_lock.locked = true;
                 }
-                lock.locked = false;
+                ext_session_lock_v1::Event::Finished => {
+                    log::warn!("the compositor refused or ended the session lock");
+                    session_lock.release();
+                }
+                _ => return,
             }
-            _ => {}
+            state.common.clone()
+        };
+        // Called with nothing borrowed: the app reads the lock's state.
+        let callback = common.borrow_mut().callbacks.session_lock_change.take();
+        if let Some(mut callback) = callback {
+            callback();
+            common
+                .borrow_mut()
+                .callbacks
+                .session_lock_change
+                .get_or_insert(callback);
         }
     }
 }
