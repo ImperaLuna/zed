@@ -2780,6 +2780,13 @@ impl Window {
         self.platform_window.set_blur_region(region);
     }
 
+    /// Linux (wayland) only: While `true`, the compositor doesn't go idle (dim, lock or sleep the
+    /// screen) as long as this window is visible, as a video player's window does. Dropped with
+    /// the window. Ignored where the compositor has no idle-inhibit protocol.
+    pub fn set_idle_inhibit(&self, inhibit: bool) {
+        self.platform_window.set_idle_inhibit(inhibit);
+    }
+
     /// Return the `WindowBounds` to indicate that how a window should be opened
     /// after it has been closed
     pub fn window_bounds(&self) -> WindowBounds {
