@@ -143,6 +143,9 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
+    /// Surface state set while a frame is drawn, waiting for that frame's
+    /// commit; committed by itself if the frame presents nothing.
+    commit_pending: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -729,6 +732,7 @@ impl WaylandWindowState {
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
+            commit_pending: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -1070,8 +1074,24 @@ impl WaylandWindowStatePtr {
         self.complete_frame();
     }
 
+    /// Commits the surface's pending state now, or with the picture of the
+    /// frame being drawn.
+    fn commit_with_frame(&self) {
+        let mut state = self.state.borrow_mut();
+        match self.frame_loop.get() {
+            FrameLoop::Ticking | FrameLoop::RescheduleRequested => state.commit_pending = true,
+            _ => state.surface.commit(),
+        }
+    }
+
     fn complete_frame(&self) {
         let mut state = self.state.borrow_mut();
+        // A region set while this tick drew waits for its picture, which
+        // never came: apply it now.
+        if state.commit_pending {
+            state.commit_pending = false;
+            state.surface.commit();
+        }
 
         let frame_loop = self.frame_loop.get();
         if frame_loop == FrameLoop::AwaitingCallback {
@@ -2216,6 +2236,8 @@ impl PlatformWindow for WaylandWindow {
             state.pending_frame_callback = Some(callback);
         }
         if renderer.draw(scene) {
+            // The present committed whatever was set while drawing.
+            state.commit_pending = false;
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
@@ -2351,10 +2373,14 @@ impl PlatformWindow for WaylandWindow {
             }
         }
 
-        // Commit so the new input region applies immediately. Otherwise it
-        // waits for the next frame, which could be the very click we want to
-        // allow passing through.
-        state.surface.commit();
+        // Outside a frame, commit so the new input region applies
+        // immediately. Otherwise it waits for the next frame, which could be
+        // the very click we want to allow passing through. While a frame is
+        // drawn it rides on that frame's commit, with the blur region and
+        // the picture they belong to: a commit of its own would show them a
+        // frame early, and make every frame two commits.
+        drop(state);
+        self.0.commit_with_frame();
     }
 
     fn window_decorations(&self) -> Decorations {
