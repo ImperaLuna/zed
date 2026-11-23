@@ -656,6 +656,8 @@ pub struct WaylandWindowStatePtr {
     /// Counts the compositor's frame callbacks: a fallback timer armed
     /// before the latest one is stale.
     callbacks_seen: Rc<Cell<u64>>,
+    /// A frame was asked for since the current tick began.
+    frame_wanted: Rc<Cell<bool>>,
 }
 
 /// How long a wanted frame waits for the compositor's callback before it is
@@ -1015,6 +1017,7 @@ impl WaylandWindow {
             fallback_armed: Rc::new(Cell::new(false)),
             fallback_delay: Rc::new(Cell::new(FRAME_FALLBACK_DELAY)),
             callbacks_seen: Rc::new(Cell::new(0)),
+            frame_wanted: Rc::new(Cell::new(false)),
         });
 
         // Kick things off. A lock surface is configured without it, and
@@ -1077,6 +1080,7 @@ impl WaylandWindowStatePtr {
 
     pub fn frame(&self, signal_at: Option<Instant>, signal_source: FrameRequestSource) {
         self.frame_loop.set(FrameLoop::Ticking);
+        self.frame_wanted.set(false);
         let mut state = self.state.borrow_mut();
         state.resize_throttle = false;
         // GPUI may throttle this tick without calling draw, so leave the request
@@ -1122,7 +1126,14 @@ impl WaylandWindowStatePtr {
         }
 
         let frame_loop = self.frame_loop.get();
+        // A frame asked for while this one was drawn waits for the
+        // callback, but not forever.
+        let wanted = self.frame_wanted.get() || state.redraw_requested;
         if frame_loop == FrameLoop::AwaitingCallback {
+            drop(state);
+            if wanted {
+                self.arm_fallback();
+            }
             return;
         }
 
@@ -1139,6 +1150,10 @@ impl WaylandWindowStatePtr {
                 }
                 state.surface.commit();
                 self.frame_loop.set(FrameLoop::AwaitingCallback);
+                drop(state);
+                if wanted {
+                    self.arm_fallback();
+                }
                 return;
             }
 
@@ -1233,6 +1248,7 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn schedule_frame(&self) {
+        self.frame_wanted.set(true);
         match self.frame_loop.get() {
             FrameLoop::Parked => {
                 self.frame_loop.set(FrameLoop::Scheduled);
