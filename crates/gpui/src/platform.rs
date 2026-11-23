@@ -495,6 +495,23 @@ pub trait Platform: 'static {
     /// Registers the callback invoked when the system resumes from sleep.
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
 
+    /// Asks the compositor to lock the session (ext-session-lock-v1 on
+    /// Wayland). The answer comes through [`Self::on_session_lock_change`].
+    fn lock_session(&self) -> anyhow::Result<()> {
+        anyhow::bail!("this platform has no session lock")
+    }
+    /// Gives up the session lock: unlocks a locked session, and withdraws a
+    /// lock the compositor hasn't confirmed.
+    fn unlock_session(&self) {}
+    /// Where the session lock this app asked for stands.
+    fn session_lock_state(&self) -> SessionLockState {
+        SessionLockState::Unlocked
+    }
+    /// Registers the callback invoked when the compositor confirms the
+    /// session lock, refuses it or ends it. Not invoked for the app's own
+    /// [`Self::lock_session`] and [`Self::unlock_session`].
+    fn on_session_lock_change(&self, _callback: Box<dyn FnMut()>) {}
+
     // Mobile platform methods. On mobile the OS owns the application
     // lifecycle: apps are backgrounded, foregrounded, and killed at the
     // system's discretion, and must react rather than decide.
@@ -755,6 +772,18 @@ pub enum PowerMode {
     Balanced,
     /// The system prioritizes performance over energy use.
     HighPower,
+}
+
+/// Where the session lock this app asked for stands ([`App::lock_session`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionLockState {
+    /// The app holds no lock: it never asked, it unlocked, or the compositor
+    /// refused or ended the lock.
+    Unlocked,
+    /// Asked for; the compositor hasn't answered yet.
+    Pending,
+    /// The compositor confirmed it: every display is covered.
+    Locked,
 }
 
 /// Thermal state of the system
@@ -2919,12 +2948,11 @@ pub enum WindowKind {
     LayerShell(layer_shell::LayerShellOptions),
 
     /// A Wayland session lock surface (ext-session-lock-v1) on the window's display.
-    /// The first one locks the session; closing the last one unlocks it.
+    /// Opening one asks for the session lock when [`App::lock_session`] hasn't yet.
     ///
-    /// Not ready for a real lock screen: closing the last lock window unlocks, so
-    /// losing the only display could unlock the session, and the app is not told
-    /// whether the compositor confirmed or refused the lock. A lock needs an
-    /// explicit unlock call and those two events first.
+    /// Closing lock windows never unlocks: the session stays locked, with no
+    /// display at all too, until [`App::unlock_session`]. Close the windows
+    /// that are left after that call.
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     SessionLock,
 

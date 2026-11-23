@@ -158,7 +158,6 @@ pub enum WaylandSurfaceState {
 
 pub struct WaylandLockSurfaceState {
     lock_surface: ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
-    lock: Rc<RefCell<super::client::SessionLockState>>,
 }
 
 impl WaylandSurfaceState {
@@ -224,17 +223,13 @@ impl WaylandSurfaceState {
             let Some(output) = target_output.as_ref() else {
                 anyhow::bail!("a session lock surface needs a display");
             };
-            let mut lock_state = globals.session_lock.borrow_mut();
-            let lock = lock_state
-                .lock
-                .get_or_insert_with(|| manager.lock(&globals.qh, ()))
-                .clone();
-            lock_state.surfaces += 1;
-            drop(lock_state);
+            let lock = globals
+                .session_lock
+                .borrow_mut()
+                .ensure(manager, &globals.qh);
             let lock_surface = lock.get_lock_surface(&surface, output, &globals.qh, surface.id());
             return Ok(WaylandSurfaceState::SessionLock(WaylandLockSurfaceState {
                 lock_surface,
-                lock: globals.session_lock.clone(),
             }));
         }
 
@@ -617,10 +612,8 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) => {
                 layer_surface.destroy();
             }
-            WaylandSurfaceState::SessionLock(WaylandLockSurfaceState { lock_surface, lock }) => {
-                // Unlock before the last surface goes, so the compositor never
-                // sees a locked output without a lock surface.
-                lock.borrow_mut().surface_destroyed();
+            WaylandSurfaceState::SessionLock(WaylandLockSurfaceState { lock_surface }) => {
+                // The session stays locked: only `unlock_session` unlocks.
                 lock_surface.destroy();
             }
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState {

@@ -73,6 +73,7 @@ pub(crate) struct PlatformHandlers {
     pub(crate) system_wake: Option<Box<dyn FnMut()>>,
     pub(crate) power_mode_change: Option<Box<dyn FnMut()>>,
     pub(crate) displays_changed: Option<Box<dyn FnMut()>>,
+    pub(crate) session_lock_change: Option<Box<dyn FnMut()>>,
 }
 
 /// A system power change, forwarded from D-Bus to the client's event loop.
@@ -778,6 +779,22 @@ impl Platform for LinuxPlatform {
 
     fn on_displays_changed(&self, callback: Box<dyn FnMut()>) {
         self.with_common(|common| common.callbacks.displays_changed = Some(callback));
+    }
+
+    fn lock_session(&self) -> anyhow::Result<()> {
+        self.connection.borrow().lock_session()
+    }
+
+    fn unlock_session(&self) {
+        self.connection.borrow().unlock_session();
+    }
+
+    fn session_lock_state(&self) -> gpui::SessionLockState {
+        self.connection.borrow().session_lock_state()
+    }
+
+    fn on_session_lock_change(&self, callback: Box<dyn FnMut()>) {
+        self.with_common(|common| common.callbacks.session_lock_change = Some(callback));
     }
 
     #[cfg(feature = "screen-capture")]

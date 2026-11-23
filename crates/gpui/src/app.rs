@@ -53,9 +53,9 @@ use crate::{
     Menu, MenuItem, MissingGlyph, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
     PlatformKeyboardLayout, PlatformKeyboardMapper, Point, PowerMode, Priority, PromptBuilder,
     PromptButton, PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle,
-    Reservation, ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
+    Reservation, ScreenCaptureSource, SessionLockState, SharedString, SubscriberSet, Subscription,
+    SvgRenderer, SystemNotification, SystemNotificationResponse, Task, TextRenderingMode,
+    TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
     WindowInvalidator, WindowingRequest,
     colors::{Colors, GlobalColors},
     hash, init_app_menus,
@@ -919,6 +919,7 @@ pub struct App {
     /// notification.
     displays: HashMap<DisplayId, DisplayState>,
     pub(crate) system_sleep_observers: SingleSubscriberSet<Handler>,
+    pub(crate) session_lock_observers: SingleSubscriberSet<Handler>,
     pub(crate) system_wake_observers: SingleSubscriberSet<Handler>,
     app_lifecycle_observers: SingleSubscriberSet<AppLifecycleHandler>,
     memory_warning_observers: SingleSubscriberSet<Handler>,
@@ -1067,6 +1068,7 @@ impl App {
                 display_observers: SingleSubscriberSet::new(),
                 displays: read_displays(platform.as_ref()),
                 system_sleep_observers: SingleSubscriberSet::new(),
+                session_lock_observers: SingleSubscriberSet::new(),
                 system_wake_observers: SingleSubscriberSet::new(),
                 app_lifecycle_observers: SingleSubscriberSet::new(),
                 memory_warning_observers: SingleSubscriberSet::new(),
@@ -1137,6 +1139,18 @@ impl App {
             move || {
                 if let Some(app) = app.upgrade() {
                     app.borrow_mut().displays_changed();
+                }
+            }
+        }));
+
+        platform.on_session_lock_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    cx.session_lock_observers
+                        .clone()
+                        .retain(move |callback| (callback)(cx));
                 }
             }
         }));
@@ -1703,6 +1717,40 @@ impl App {
         F: 'static + FnMut(&mut App),
     {
         self.thermal_state_observers.insert(Box::new(move |cx| {
+            callback(cx);
+            true
+        }))
+    }
+
+    /// Asks the compositor to lock the session (ext-session-lock-v1 on
+    /// Wayland), before or without any [`WindowKind::SessionLock`] window:
+    /// a session with no display locks too. The compositor's answer comes
+    /// through [`Self::on_session_lock_change`].
+    pub fn lock_session(&self) -> Result<()> {
+        self.platform.lock_session()
+    }
+
+    /// Gives up the session lock: unlocks a locked session, and withdraws a
+    /// lock the compositor hasn't confirmed. Nothing else unlocks, closing
+    /// every lock window included; close the ones left after this call.
+    pub fn unlock_session(&self) {
+        self.platform.unlock_session();
+    }
+
+    /// Where the session lock this app asked for stands.
+    pub fn session_lock_state(&self) -> SessionLockState {
+        self.platform.session_lock_state()
+    }
+
+    /// Invokes a handler when the compositor confirms the session lock
+    /// ([`SessionLockState::Locked`]), or refuses or ends it
+    /// ([`SessionLockState::Unlocked`]). Not invoked for the app's own
+    /// [`Self::lock_session`] and [`Self::unlock_session`].
+    pub fn on_session_lock_change<F>(&self, mut callback: F) -> Subscription
+    where
+        F: 'static + FnMut(&mut App),
+    {
+        self.session_lock_observers.insert(Box::new(move |cx| {
             callback(cx);
             true
         }))

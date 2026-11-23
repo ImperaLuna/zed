@@ -146,6 +146,31 @@ impl DisplayConnection {
         )
     }
 
+    /// The session lock is Wayland's (ext-session-lock-v1).
+    pub(crate) fn lock_session(&self) -> anyhow::Result<()> {
+        match self {
+            #[cfg(feature = "wayland")]
+            DisplayConnection::Wayland(connection) => connection.lock_session(),
+            _ => anyhow::bail!("only a Wayland session can be locked"),
+        }
+    }
+
+    pub(crate) fn unlock_session(&self) {
+        match self {
+            #[cfg(feature = "wayland")]
+            DisplayConnection::Wayland(connection) => connection.unlock_session(),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn session_lock_state(&self) -> gpui::SessionLockState {
+        match self {
+            #[cfg(feature = "wayland")]
+            DisplayConnection::Wayland(connection) => connection.session_lock_state(),
+            _ => gpui::SessionLockState::Unlocked,
+        }
+    }
+
     pub(crate) fn active_window(&self) -> Option<AnyWindowHandle> {
         dispatch!(self, connection => connection.active_window(), headless => None)
     }
