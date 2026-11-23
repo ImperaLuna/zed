@@ -146,6 +146,13 @@ pub struct WaylandWindowState {
     /// Surface state set while a frame is drawn, waiting for that frame's
     /// commit; committed by itself if the frame presents nothing.
     commit_pending: bool,
+    /// The size a layer surface was asked to be, sent with the first
+    /// picture drawn at that size; until then the compositor knows nothing
+    /// of it.
+    layer_size_pending: Option<Size<i32>>,
+    /// The viewport's destination, sent with the first picture drawn at
+    /// that size.
+    viewport_destination_pending: Option<Size<i32>>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -733,6 +740,8 @@ impl WaylandWindowState {
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
             commit_pending: false,
+            layer_size_pending: None,
+            viewport_destination_pending: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -1231,6 +1240,12 @@ impl WaylandWindowStatePtr {
                 let mut state = self.state.borrow_mut();
 
                 if let Some(mut configure) = state.in_progress_configure.take() {
+                    // Asked for a size the compositor hasn't been sent yet,
+                    // a layer surface takes no size from a configure: it
+                    // answers an older request, and would undo the new one.
+                    if state.layer_size_pending.is_some() {
+                        configure.size = None;
+                    }
                     let got_unmaximized = state.maximized && !configure.maximized;
                     state.fullscreen = configure.fullscreen;
                     state.maximized = configure.maximized;
@@ -1686,9 +1701,11 @@ impl WaylandWindowStatePtr {
             self.callbacks.borrow_mut().resize = Some(fun);
         }
 
-        let state = self.state.borrow_mut();
-        if let Some(viewport) = &state.viewport {
-            viewport.set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
+        let mut state = self.state.borrow_mut();
+        if state.viewport.is_some() {
+            // With the picture of this size: sent before it, the compositor
+            // would stretch the last picture to it.
+            state.viewport_destination_pending = Some(size.map(|length| f32::from(length) as i32));
         }
         update_window(state);
     }
@@ -1902,7 +1919,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn resize(&mut self, size: Size<Pixels>) {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
         let state_ptr = self.0.clone();
 
         // A popup's placement is the compositor's, so a resize re-runs the positioner and the
@@ -1936,12 +1953,19 @@ impl PlatformWindow for WaylandWindow {
         .map(|v| f32::from(v) as i32)
         .map_size(|v| if v <= 0 { 1 } else { v });
 
-        state.surface_state.set_geometry(
-            window_geometry.origin.x,
-            window_geometry.origin.y,
-            window_geometry.size.width,
-            window_geometry.size.height,
-        );
+        if matches!(state.surface_state, WaylandSurfaceState::LayerShell(_)) {
+            // Sent with the first picture of the new size (`draw`): any
+            // commit before it would show the compositor the last picture
+            // in the new box, stretched for a frame.
+            state.layer_size_pending = Some(window_geometry.size);
+        } else {
+            state.surface_state.set_geometry(
+                window_geometry.origin.x,
+                window_geometry.origin.y,
+                window_geometry.size.width,
+                window_geometry.size.height,
+            );
+        }
 
         state
             .globals
@@ -2234,6 +2258,18 @@ impl PlatformWindow for WaylandWindow {
         if state.pending_frame_callback.is_none() {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
+        }
+        let drawn_size = state.bounds.size.map(|length| f32::from(length) as i32);
+        if let Some(destination) = state.viewport_destination_pending.take() {
+            if let Some(viewport) = &state.viewport {
+                viewport.set_destination(destination.width, destination.height);
+            }
+        }
+        if state.layer_size_pending == Some(drawn_size)
+            && let Some(layer_surface) = state.surface_state.layer_surface()
+        {
+            layer_surface.set_size(drawn_size.width as u32, drawn_size.height as u32);
+            state.layer_size_pending = None;
         }
         if renderer.draw(scene) {
             // The present committed whatever was set while drawing.
