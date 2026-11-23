@@ -1426,6 +1426,7 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn set_layer(&self, _layer: layer_shell::Layer) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
     fn set_blur_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
+    fn set_idle_inhibit(&self, _inhibit: bool) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }

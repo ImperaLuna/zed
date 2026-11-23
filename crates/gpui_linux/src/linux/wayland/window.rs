@@ -20,6 +20,7 @@ use wayland_client::{
 };
 use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::ext::session_lock::v1::client::ext_session_lock_surface_v1;
+use wayland_protocols::wp::idle_inhibit::zv1::client::zwp_idle_inhibitor_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -112,6 +113,8 @@ pub struct WaylandWindowState {
     app_id: Option<String>,
     appearance: WindowAppearance,
     kde_blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    /// Held while the app keeps the compositor from going idle.
+    idle_inhibitor: Option<zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1>,
     background_effects: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     /// The blurred area, when the app limits it; None blurs the whole window.
     blur_rects: Option<Vec<Bounds<i32>>>,
@@ -705,6 +708,7 @@ impl WaylandWindowState {
             surface,
             app_id: options.app_id,
             kde_blur: None,
+            idle_inhibitor: None,
             background_effects: None,
             blur_rects: None,
             viewport,
@@ -882,6 +886,11 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.kde_blur {
             blur.release();
+        }
+
+        // The idle inhibitor must be destroyed before the wl_surface.
+        if let Some(inhibitor) = state.idle_inhibitor.take() {
+            inhibitor.destroy();
         }
 
         // Destroy background effects, this has no dependencies.
@@ -2035,6 +2044,24 @@ impl PlatformWindow for WaylandWindow {
             toplevel.set_app_id(app_id.to_owned());
         }
         state.app_id = Some(app_id.to_owned());
+    }
+
+    fn set_idle_inhibit(&self, inhibit: bool) {
+        let mut state = self.borrow_mut();
+        match (inhibit, state.idle_inhibitor.take()) {
+            (true, Some(inhibitor)) => state.idle_inhibitor = Some(inhibitor),
+            (true, None) => {
+                let Some(manager) = state.globals.idle_inhibit_manager.clone() else {
+                    log::warn!("The compositor has no idle-inhibit protocol: it may still go idle");
+                    return;
+                };
+                let inhibitor =
+                    manager.create_inhibitor(&state.surface, &state.globals.qh, ());
+                state.idle_inhibitor = Some(inhibitor);
+            }
+            (false, Some(inhibitor)) => inhibitor.destroy(),
+            (false, None) => {}
+        }
     }
 
     fn set_blur_region(&self, region: Option<&[Bounds<Pixels>]>) {
