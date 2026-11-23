@@ -2763,12 +2763,22 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
     // replaces the deprecated kde-blur protocol, which is no longer supported
     // since KDE Plasma 6.7.
     // https://invent.kde.org/plasma/kwin/-/commit/7f9e0aa1cd2c2ab4fea1097800893b6f780089eb
-    // An empty blur region goes as no effect at all: live Hyprland was seen
-    // blurring a whole layer surface whose region had become empty.
-    let blurs_nothing = state
-        .blur_rects
-        .as_ref()
-        .is_some_and(|rects| rects.is_empty());
+    // Hyprland blurs the whole surface for a region with nothing on it: an
+    // empty one, or one wholly outside the surface, as glass that slides up
+    // off a layer surface's top edge. So the region is clipped to the
+    // surface, and an empty one goes as no effect at all.
+    let surface_area = state
+        .bounds
+        .map_origin(|_| px(0.0))
+        .map(|value| value.to_i32());
+    let blur_rects: Option<Vec<Bounds<i32>>> = state.blur_rects.as_ref().map(|rects| {
+        rects
+            .iter()
+            .map(|rect| rect.intersect(&surface_area))
+            .filter(|rect| rect.size.width > 0 && rect.size.height > 0)
+            .collect()
+    });
+    let blurs_nothing = blur_rects.as_ref().is_some_and(|rects| rects.is_empty());
     if let Some(ref background_effects_manager) = state.globals.background_effects_manager {
         if state.background_appearance == WindowBackgroundAppearance::Blurred && !blurs_nothing {
             if state.background_effects.is_none() {
@@ -2781,7 +2791,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                 state.background_effects = Some(background_effects);
             }
 
-            match &state.blur_rects {
+            match &blur_rects {
                 Some(rects) => {
                     for rect in rects {
                         region.add(
