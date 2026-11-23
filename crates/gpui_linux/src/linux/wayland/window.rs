@@ -653,6 +653,9 @@ pub struct WaylandWindowStatePtr {
     /// callback doesn't come first.
     fallback_armed: Rc<Cell<bool>>,
     fallback_delay: Rc<Cell<Duration>>,
+    /// Counts the compositor's frame callbacks: a fallback timer armed
+    /// before the latest one is stale.
+    callbacks_seen: Rc<Cell<u64>>,
 }
 
 /// How long a wanted frame waits for the compositor's callback before it is
@@ -1011,6 +1014,7 @@ impl WaylandWindow {
             scheduled_frame_at: Rc::new(Cell::new(None)),
             fallback_armed: Rc::new(Cell::new(false)),
             fallback_delay: Rc::new(Cell::new(FRAME_FALLBACK_DELAY)),
+            callbacks_seen: Rc::new(Cell::new(0)),
         });
 
         // Kick things off. A lock surface is configured without it, and
@@ -1163,6 +1167,9 @@ impl WaylandWindowStatePtr {
         // timer owned the render-loop wakeup.
         self.state.borrow_mut().pending_frame_callback = None;
         self.fallback_delay.set(FRAME_FALLBACK_DELAY);
+        self.fallback_armed.set(false);
+        self.callbacks_seen
+            .set(self.callbacks_seen.get().wrapping_add(1));
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             self.frame(signal_at, FrameRequestSource::NativeCallback);
         }
@@ -1186,7 +1193,10 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn fallback_timer_fired(&self) {
+    pub fn fallback_timer_fired(&self, callbacks_seen: u64) {
+        if callbacks_seen != self.callbacks_seen.get() {
+            return;
+        }
         self.fallback_armed.set(false);
         if self.frame_loop.get() == FrameLoop::AwaitingCallback {
             let delay = self.fallback_delay.get();
@@ -1210,7 +1220,11 @@ impl WaylandWindowStatePtr {
         let surface_id = state.surface.id();
         let client = state.client.clone();
         drop(state);
-        let armed = client.schedule_frame_fallback(&surface_id, self.fallback_delay.get());
+        let armed = client.schedule_frame_fallback(
+            &surface_id,
+            self.fallback_delay.get(),
+            self.callbacks_seen.get(),
+        );
         self.fallback_armed.set(armed);
     }
 

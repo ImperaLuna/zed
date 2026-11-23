@@ -708,7 +708,12 @@ impl WaylandClientStatePtr {
     }
 
     /// Whether the timer is set: not while the client is being updated.
-    pub fn schedule_frame_fallback(&self, surface_id: &ObjectId, delay: Duration) -> bool {
+    pub fn schedule_frame_fallback(
+        &self,
+        surface_id: &ObjectId,
+        delay: Duration,
+        callbacks_seen: u64,
+    ) -> bool {
         let client = self.get_client();
         let Ok(state) = client.try_borrow() else {
             return false;
@@ -724,7 +729,7 @@ impl WaylandClientStatePtr {
                     };
                     let window = get_window(&mut client.borrow_mut(), &surface_id);
                     if let Some(window) = window {
-                        window.fallback_timer_fired();
+                        window.fallback_timer_fired(callbacks_seen);
                     }
                     TimeoutAction::Drop
                 })
