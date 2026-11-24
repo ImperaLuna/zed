@@ -156,11 +156,80 @@ struct InstanceBindings {
     polychrome_sprites: InstanceBinding,
 }
 
+#[derive(Clone)]
 struct WgpuBindGroupLayouts {
     globals: wgpu::BindGroupLayout,
     instances: wgpu::BindGroupLayout,
     texture: wgpu::BindGroupLayout,
     surfaces: wgpu::BindGroupLayout,
+}
+
+/// What a window's pipelines are built for.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PipelinesKey {
+    format: wgpu::TextureFormat,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    path_sample_count: u32,
+    dual_source_blending: bool,
+}
+
+/// The bind group layouts and the render pipelines built on one device,
+/// shared by every window drawing with it. Building a window's pipelines
+/// takes tens of milliseconds, so a window that built its own stalled its
+/// first frame, and every window's frames with it.
+#[derive(Default)]
+pub(crate) struct SharedPipelines {
+    built: parking_lot::Mutex<BuiltPipelines>,
+}
+
+#[derive(Default)]
+struct BuiltPipelines {
+    layouts: Option<WgpuBindGroupLayouts>,
+    custom_layout: Option<wgpu::BindGroupLayout>,
+    main: FxHashMap<PipelinesKey, Arc<WgpuPipelines>>,
+    custom: FxHashMap<(CustomShaderKey, wgpu::TextureFormat, wgpu::CompositeAlphaMode), wgpu::RenderPipeline>,
+}
+
+impl SharedPipelines {
+    fn layouts(&self, device: &wgpu::Device, uses_webgl_instance_data: bool) -> WgpuBindGroupLayouts {
+        self.built
+            .lock()
+            .layouts
+            .get_or_insert_with(|| {
+                WgpuRendererCore::create_bind_group_layouts(device, uses_webgl_instance_data)
+            })
+            .clone()
+    }
+
+    fn main(&self, key: PipelinesKey, build: impl FnOnce() -> WgpuPipelines) -> Arc<WgpuPipelines> {
+        self.built
+            .lock()
+            .main
+            .entry(key)
+            .or_insert_with(|| Arc::new(build()))
+            .clone()
+    }
+
+    fn custom_layout(&self, build: impl FnOnce() -> wgpu::BindGroupLayout) -> wgpu::BindGroupLayout {
+        self.built
+            .lock()
+            .custom_layout
+            .get_or_insert_with(build)
+            .clone()
+    }
+
+    fn custom(
+        &self,
+        key: (CustomShaderKey, wgpu::TextureFormat, wgpu::CompositeAlphaMode),
+        build: impl FnOnce() -> wgpu::RenderPipeline,
+    ) -> wgpu::RenderPipeline {
+        self.built
+            .lock()
+            .custom
+            .entry(key)
+            .or_insert_with(build)
+            .clone()
+    }
 }
 
 /// Shared GPU context reference, used to coordinate device recovery across multiple windows.
@@ -186,7 +255,8 @@ struct WgpuResources {
     /// opaque or transparent, and dropped when that changes. A Wayland
     /// window starts transparent and usually turns opaque before its first
     /// frame, so building them up front compiled every shader twice.
-    pipelines: Option<WgpuPipelines>,
+    pipelines: Option<Arc<WgpuPipelines>>,
+    shared: Arc<SharedPipelines>,
     bind_group_layouts: WgpuBindGroupLayouts,
     atlas_sampler: wgpu::Sampler,
     atlas_texture_bind_groups: FxHashMap<AtlasTextureId, CachedTextureBindGroup>,
@@ -304,7 +374,7 @@ struct CachedTextureBindGroup {
 impl WgpuResources {
     fn pipelines(&self) -> &WgpuPipelines {
         self.pipelines
-            .as_ref()
+            .as_deref()
             .expect("pipelines are built at the start of each frame")
     }
 
@@ -1332,7 +1402,8 @@ impl WgpuRendererCore {
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
-        let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
+        let shared = Arc::clone(context.shared_pipelines());
+        let bind_group_layouts = shared.layouts(&device, uses_webgl_instance_data);
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
             mag_filter: wgpu::FilterMode::Linear,
@@ -1441,6 +1512,7 @@ impl WgpuRendererCore {
                 queue,
                 pipelines: None,
                 custom_shaders: None,
+                shared,
                 bind_group_layouts,
                 atlas_sampler,
                 atlas_texture_bind_groups: FxHashMap::default(),
@@ -1485,15 +1557,24 @@ impl WgpuRendererCore {
             return;
         }
         let resources = &mut self.resources;
-        resources.pipelines = Some(Self::create_pipelines(
-            &resources.device,
-            &resources.bind_group_layouts,
-            self.target_format,
-            self.alpha_mode,
-            self.rendering_params.path_sample_count,
-            self.dual_source_blending,
-            self.uses_webgl_instance_data,
-        ));
+        let key = PipelinesKey {
+            format: self.target_format,
+            alpha_mode: self.alpha_mode,
+            path_sample_count: self.rendering_params.path_sample_count,
+            dual_source_blending: self.dual_source_blending,
+        };
+        let pipelines = resources.shared.main(key, || {
+            Self::create_pipelines(
+                &resources.device,
+                &resources.bind_group_layouts,
+                key.format,
+                key.alpha_mode,
+                key.path_sample_count,
+                key.dual_source_blending,
+                self.uses_webgl_instance_data,
+            )
+        });
+        resources.pipelines = Some(pipelines);
     }
 
     fn ensure_intermediate_textures(&mut self, size: Size<DevicePixels>) {
@@ -1872,6 +1953,7 @@ impl WgpuRendererCore {
             return;
         }
         let target_format = self.target_format;
+        let alpha_mode = self.alpha_mode;
         let blend = match self.alpha_mode {
             wgpu::CompositeAlphaMode::PreMultiplied => {
                 wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
@@ -1880,19 +1962,22 @@ impl WgpuRendererCore {
         };
         let resources = &mut self.resources;
         let device = resources.device.clone();
+        let shared = Arc::clone(&resources.shared);
         let custom = resources.custom_shaders.get_or_insert_with(|| {
-            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("custom_shader_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: NonZeroU64::new(CUSTOM_SHADER_BLOCK),
-                    },
-                    count: None,
-                }],
+            let layout = shared.custom_layout(|| {
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("custom_shader_layout"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: NonZeroU64::new(CUSTOM_SHADER_BLOCK),
+                        },
+                        count: None,
+                    }],
+                })
             });
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("custom_shader_uniforms"),
@@ -1929,60 +2014,62 @@ impl WgpuRendererCore {
             }
             let key = custom_shader_key(shader);
             if !custom.pipelines.contains_key(&key) {
-                let (image_prelude, image_layout) = match shader.image {
-                    Some(_) => (
-                        CUSTOM_SHADER_IMAGE,
-                        Some(&resources.bind_group_layouts.texture),
-                    ),
-                    None => ("", None),
-                };
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("custom_shader"),
-                    source: wgpu::ShaderSource::Wgsl(
-                        format!(
-                            "{CUSTOM_SHADER_PRELUDE}\n{image_prelude}\n{}",
-                            shader.source
-                        )
-                        .into(),
-                    ),
-                });
-                let pipeline_layout =
-                    device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                        label: Some("custom_shader_pipeline_layout"),
-                        bind_group_layouts: &[
-                            Some(&resources.bind_group_layouts.globals),
-                            Some(&custom.layout),
-                            image_layout,
-                        ],
-                        immediate_size: 0,
+                let pipeline = shared.custom((key, target_format, alpha_mode), || {
+                    let (image_prelude, image_layout) = match shader.image {
+                        Some(_) => (
+                            CUSTOM_SHADER_IMAGE,
+                            Some(&resources.bind_group_layouts.texture),
+                        ),
+                        None => ("", None),
+                    };
+                    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                        label: Some("custom_shader"),
+                        source: wgpu::ShaderSource::Wgsl(
+                            format!(
+                                "{CUSTOM_SHADER_PRELUDE}\n{image_prelude}\n{}",
+                                shader.source
+                            )
+                            .into(),
+                        ),
                     });
-                let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("custom_shader"),
-                    layout: Some(&pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &module,
-                        entry_point: Some("vs_custom"),
-                        buffers: &[],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &module,
-                        entry_point: Some("fs_custom"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: target_format,
-                            blend: Some(blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: wgpu::PipelineCompilationOptions::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleStrip,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
-                    cache: None,
+                    let pipeline_layout =
+                        device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                            label: Some("custom_shader_pipeline_layout"),
+                            bind_group_layouts: &[
+                                Some(&resources.bind_group_layouts.globals),
+                                Some(&custom.layout),
+                                image_layout,
+                            ],
+                            immediate_size: 0,
+                        });
+                    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("custom_shader"),
+                        layout: Some(&pipeline_layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("vs_custom"),
+                            buffers: &[],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("fs_custom"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: target_format,
+                                blend: Some(blend),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleStrip,
+                            ..Default::default()
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: None,
+                    })
                 });
                 custom.pipelines.insert(key, pipeline);
             }
