@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     hash::Hash,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd as _, RawFd},
@@ -1818,18 +1818,26 @@ pub struct SessionLockState {
     lock: Option<ext_session_lock_v1::ExtSessionLockV1>,
     /// The compositor confirmed `lock`.
     locked: bool,
+    /// Set when the compositor refuses `lock`; shared with its lock surfaces.
+    refused: Rc<Cell<bool>>,
 }
 
 impl SessionLockState {
-    /// The lock, asked for now when there is none yet.
+    /// The lock, asked for now when there is none yet, and the flag that
+    /// tells its lock surfaces it was refused.
     pub fn ensure(
         &mut self,
         manager: &ext_session_lock_manager_v1::ExtSessionLockManagerV1,
         qh: &QueueHandle<WaylandClientStatePtr>,
-    ) -> ext_session_lock_v1::ExtSessionLockV1 {
-        self.lock
+    ) -> (ext_session_lock_v1::ExtSessionLockV1, Rc<Cell<bool>>) {
+        if self.lock.is_none() {
+            self.refused = Rc::default();
+        }
+        let lock = self
+            .lock
             .get_or_insert_with(|| manager.lock(qh, ()))
-            .clone()
+            .clone();
+        (lock, self.refused.clone())
     }
 
     pub fn state(&self) -> gpui::SessionLockState {
@@ -1888,6 +1896,12 @@ impl Dispatch<ext_session_lock_v1::ExtSessionLockV1, ()> for WaylandClientStateP
                 }
                 ext_session_lock_v1::Event::Finished => {
                     log::warn!("the compositor refused or ended the session lock");
+                    // Hyprland makes no lock surfaces for a lock it refuses, so
+                    // destroying them later would name objects it never made:
+                    // https://github.com/hyprwm/Hyprland/blob/v0.57.2/src/protocols/SessionLock.cpp
+                    if !session_lock.locked {
+                        session_lock.refused.set(true);
+                    }
                     session_lock.release();
                 }
                 _ => return,

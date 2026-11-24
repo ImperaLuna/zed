@@ -171,6 +171,8 @@ pub enum WaylandSurfaceState {
 
 pub struct WaylandLockSurfaceState {
     lock_surface: ext_session_lock_surface_v1::ExtSessionLockSurfaceV1,
+    /// The compositor refused the lock this surface was asked for.
+    refused: Rc<Cell<bool>>,
 }
 
 impl WaylandSurfaceState {
@@ -236,13 +238,14 @@ impl WaylandSurfaceState {
             let Some(output) = target_output.as_ref() else {
                 anyhow::bail!("a session lock surface needs a display");
             };
-            let lock = globals
+            let (lock, refused) = globals
                 .session_lock
                 .borrow_mut()
                 .ensure(manager, &globals.qh);
             let lock_surface = lock.get_lock_surface(&surface, output, &globals.qh, surface.id());
             return Ok(WaylandSurfaceState::SessionLock(WaylandLockSurfaceState {
                 lock_surface,
+                refused,
             }));
         }
 
@@ -625,9 +628,17 @@ impl WaylandSurfaceState {
             WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) => {
                 layer_surface.destroy();
             }
-            WaylandSurfaceState::SessionLock(WaylandLockSurfaceState { lock_surface }) => {
-                // The session stays locked: only `unlock_session` unlocks.
-                lock_surface.destroy();
+            WaylandSurfaceState::SessionLock(WaylandLockSurfaceState {
+                lock_surface,
+                refused,
+            }) => {
+                // The session stays locked: only `unlock_session` unlocks. A
+                // refused lock's surface may not exist in the compositor, and
+                // a destroy naming it would be a protocol error that ends the
+                // app, so its proxy is dropped without a request.
+                if !refused.get() {
+                    lock_surface.destroy();
+                }
             }
             WaylandSurfaceState::Popup(WaylandPopupSurfaceState {
                 xdg_surface,
